@@ -375,19 +375,30 @@ export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
                 const completionId = newCompletionId()
                 const createdAt = Math.floor(Date.now() / 1000)
 
+                const startParentMessageId = conv.parentMessageId
+                const startHasParent = conv.hasParent
+                let latestResponseId = null
+
                 const onSessionReady = (requestId, responseId) => {
-                  conv.parentMessageId = responseId
-                  conv.hasParent = true
-                  conv.turn++
+                  latestResponseId = responseId
                 }
 
                 // Register the continuation key for the next turn even after a
-                // partial stream: `ready` already advanced the parent id, so a
-                // follow-up can chain from here.
+                // partial stream: if the turn aborted or encountered an error,
+                // roll back parentMessageId to startParentMessageId so subsequent
+                // client retries branch cleanly from the previous node in DeepSeek's tree.
                 let finished = false
-                const onFinish = (total, reply, toolCalls, shownText) => {
+                const onFinish = (total, reply, toolCalls, shownText, isError = false) => {
                   if (finished) return
                   finished = true
+
+                  if (isError || !latestResponseId) {
+                    conv.rollback(startParentMessageId, startHasParent)
+                    release()
+                    return
+                  }
+
+                  conv.commitTurn(latestResponseId)
                   conv.usageBefore(total)
                   // The next request carries this assistant turn back as the
                   // client was shown it — the fence stripped, whatever text
@@ -437,6 +448,7 @@ export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
                   toolFormat,
                 })
               } catch (err) {
+                conv.rollback(startParentMessageId, startHasParent)
                 release()
                 throw err
               }

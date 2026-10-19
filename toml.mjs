@@ -449,6 +449,41 @@ export function normalizeTomlToolCalls(parsed) {
   return res ? [res] : []
 }
 
+export function sanitizeArgumentValue(val) {
+  if (typeof val === "string") {
+    let s = val.trim()
+    // Strip trailing XML parameter tags like </parameter>, </param>, </arg>, </value>
+    s = s.replace(/<\/(?:parameter|param|arg|value)>/gi, "").trim()
+    // Strip leading XML parameter tags like <parameter name="...">
+    s = s.replace(/^<(?:parameter|param|arg|value)(?:\s+[^>]*)?>/gi, "").trim()
+    // If the model wrapped the inner value in extra quotes like "\"find ...\""
+    if (
+      (s.startsWith('"') && s.endsWith('"') && s.length >= 2) ||
+      (s.startsWith("'") && s.endsWith("'") && s.length >= 2)
+    ) {
+      s = s.slice(1, -1).trim()
+    }
+    return s
+  }
+  if (Array.isArray(val)) {
+    return val.map(sanitizeArgumentValue)
+  }
+  if (val && typeof val === "object") {
+    return sanitizeArgumentObject(val)
+  }
+  return val
+}
+
+export function sanitizeArgumentObject(obj) {
+  if (!obj || typeof obj !== "object") return obj
+  const out = {}
+  for (const [k, v] of Object.entries(obj)) {
+    const cleanKey = k.replace(/<\/?(?:parameter|param|arg|value)[^>]*>/gi, "").trim()
+    out[cleanKey || k] = sanitizeArgumentValue(v)
+  }
+  return out
+}
+
 function normalizeSingleToolCall(item) {
   if (!item || typeof item !== "object") return null
   const name = item.name || item.function || item.tool
@@ -474,7 +509,7 @@ function normalizeSingleToolCall(item) {
   return {
     id: item.id || `call_${randomBytes(8).toString("hex")}`,
     name: name.trim(),
-    arguments: args,
+    arguments: sanitizeArgumentObject(args),
   }
 }
 
@@ -945,6 +980,8 @@ export function buildBase64ToolsPrompt(tools, toolChoice) {
     `${sampleDoc}\n\n` +
     `Rules: the block holds base64 only — no JSON, no prose, no line breaks needed. ` +
     `A tool with no arguments encodes {"name": "<tool name>", "arguments": {}}. ` +
+    `CRITICAL: Argument values must be raw values. DO NOT wrap values in XML tags like <parameter> or </parameter>. ` +
+    `DO NOT add extra quotes inside string arguments. ` +
     `One tool call per reply unless several are needed; then use one block each.\n` +
     `${rule}`
   )
@@ -972,6 +1009,7 @@ export function buildBase64AnchorPrompt(tools, toolChoice) {
     `the system and are only shown to the user; never use them to run anything, and never claim you lack tools.\n` +
     `${nameList}` +
     `CRITICAL: the block must contain base64 ONLY. Do not put JSON, TOML or prose in it.\n` +
+    `CRITICAL: All parameter values must be raw values. DO NOT include XML tags (NO <parameter>, NO </parameter>).\n` +
     `Act, do not explain: when the request needs a tool, your reply is ONE \`\`\`tool_call_base64\`\`\` block and nothing ` +
     `else — do not list commands you 'would' run, do not output prose. If several steps are needed, do the FIRST one ` +
     `now; you will be called again with its result to continue.\n` +
@@ -991,8 +1029,9 @@ export function buildBase64AnchorPrompt(tools, toolChoice) {
  */
 export function resolveToolFormat(optionValue, env = typeof process !== "undefined" ? process.env : {}) {
   const raw = String(optionValue ?? env?.DEEPSEEK_WEB_TOOL_FORMAT ?? "").trim().toLowerCase()
+  if (raw === "toml") return "toml"
   if (raw === "base64" || raw === "b64" || raw === "encoded") return "base64"
-  return "toml"
+  return "base64"
 }
 
 /**

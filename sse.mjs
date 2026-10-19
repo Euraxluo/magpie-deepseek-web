@@ -290,7 +290,7 @@ export function createOpenAiStreamResponse({
             controller.close()
             // The client keeps what it was actually sent, which for a gated
             // stream is the text the gate let through, not the cleaned text.
-            if (onFinish) onFinish(total, reply, toolCalls, gate?.sent ?? cleanText)
+            if (onFinish) onFinish(total, reply, toolCalls, gate?.sent ?? cleanText, false)
             return
           }
         }
@@ -298,13 +298,13 @@ export function createOpenAiStreamResponse({
         sendDelta(takeRole(), "stop", streamOptions?.include_usage ? usage : null)
         send("[DONE]")
         controller.close()
-        if (onFinish) onFinish(total, reply, null, reply)
+        if (onFinish) onFinish(total, reply, null, reply, false)
       } catch (err) {
         if (signal?.aborted) {
           try {
             controller.close()
           } catch {}
-          if (onFinish) onFinish(accumulated.value, reply, null)
+          if (onFinish) onFinish(accumulated.value, reply, null, null, true)
           return
         }
         // Tell the client what went wrong the way OpenAI's own streams do,
@@ -316,14 +316,14 @@ export function createOpenAiStreamResponse({
         try {
           controller.close()
         } catch {}
-        if (onFinish) onFinish(accumulated.value, reply, null)
+        if (onFinish) onFinish(accumulated.value, reply, null, null, true)
       }
     },
 
     // A client that drops the stream (a stopped agent run) ends the turn too,
     // so the conversation isn't held for it.
     cancel() {
-      if (onFinish) onFinish(accumulated.value, reply, null)
+      if (onFinish) onFinish(accumulated.value, reply, null, null, true)
     },
   })
 
@@ -386,7 +386,7 @@ export async function createOpenAiJsonResponse({
     }
   }
 
-  if (onFinish) onFinish(total, content, toolCalls.length > 0 ? toolCalls : null, messageContent ?? "")
+  if (onFinish) onFinish(total, content, toolCalls.length > 0 ? toolCalls : null, messageContent ?? "", false)
 
   const message = { role: "assistant", content: messageContent }
   if (reasoningContent) message.reasoning_content = reasoningContent

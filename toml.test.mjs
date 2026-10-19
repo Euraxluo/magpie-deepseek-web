@@ -379,15 +379,37 @@ test("the configured format is parsed first and the other is the fallback", () =
   assert.equal(parseToolCallsAnyFormat("just prose", "toml").toolCalls.length, 0)
 })
 
-test("resolveToolFormat: option, then environment, then TOML", () => {
+test("resolveToolFormat: option, then environment, then defaults to base64", () => {
   assert.equal(resolveToolFormat("base64"), "base64")
   assert.equal(resolveToolFormat("B64"), "base64")
   assert.equal(resolveToolFormat("encoded"), "base64")
   assert.equal(resolveToolFormat("toml"), "toml")
-  assert.equal(resolveToolFormat(""), "toml")
-  assert.equal(resolveToolFormat(undefined, {}), "toml")
+  assert.equal(resolveToolFormat(""), "base64")
+  assert.equal(resolveToolFormat(undefined, {}), "base64")
+  assert.equal(resolveToolFormat(undefined, { DEEPSEEK_WEB_TOOL_FORMAT: "toml" }), "toml")
   assert.equal(resolveToolFormat(undefined, { DEEPSEEK_WEB_TOOL_FORMAT: "base64" }), "base64")
   assert.equal(resolveToolFormat("toml", { DEEPSEEK_WEB_TOOL_FORMAT: "base64" }), "toml")
+})
+
+test("sanitizeArgumentValue and normalizeSingleToolCall clean hallucinated XML parameter tags and extra quotes", () => {
+  const jsonWithTags = {
+    name: "bash",
+    parameters: {
+      command: '"find src -type f | wc -l"</parameter>',
+      timeout: 30,
+    },
+  }
+  const calls = normalizeTomlToolCalls(jsonWithTags)
+  assert.equal(calls.length, 1)
+  assert.equal(calls[0].name, "bash")
+  assert.equal(calls[0].arguments.command, "find src -type f | wc -l")
+  assert.equal(calls[0].arguments.timeout, 30)
+
+  // base64 payload containing XML tags inside arguments
+  const b64 = Buffer.from(JSON.stringify(jsonWithTags)).toString("base64")
+  const parsed = parseBase64ToolCall(b64)
+  assert.equal(parsed.length, 1)
+  assert.equal(parsed[0].arguments.command, "find src -type f | wc -l")
 })
 
 test("the base64 prompts show a real encoded example and forbid JSON in the reply", () => {

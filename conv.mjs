@@ -138,6 +138,27 @@ export class Conversation {
     this.queue = Promise.resolve()
   }
 
+  /**
+   * Commits a successful turn by updating the upstream parentMessageId and
+   * advancing the turn count.
+   */
+  commitTurn(responseId) {
+    if (!responseId) return
+    this.parentMessageId = responseId
+    this.hasParent = true
+    this.turn++
+  }
+
+  /**
+   * Reverts parent message tracking to the start of a turn so a failed turn
+   * or a client retry branches cleanly from the previous node in DeepSeek's
+   * message tree instead of building on a failed node.
+   */
+  rollback(startParentMessageId, startHasParent) {
+    this.parentMessageId = startParentMessageId
+    this.hasParent = startHasParent
+  }
+
   /** Runs `fn` after the turns already queued for this conversation. */
   async run(fn) {
     const release = await this.acquire()

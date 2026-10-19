@@ -547,7 +547,7 @@ test("the loader turns a tools request into a TOML prompt upstream and tool_call
   try {
     const { default: plugin, _internal } = await import("./index.mjs")
     _internal.convStore.clear?.()
-    const hooks = await plugin({ client: {} })
+    const hooks = await plugin({ client: {} }, { toolFormat: "toml" })
     const loaded = await hooks.auth.loader(async () => ({ type: "api", key: "tok" }))
 
     const res = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
