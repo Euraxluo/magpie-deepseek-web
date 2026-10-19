@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto"
+import { parseToolCalls, ToolFenceGate } from "./toml.mjs"
 
 /**
  * Creates an OpenAI-compatible completion ID.
@@ -202,6 +203,7 @@ export function createOpenAiStreamResponse({
   onFinish,
   streamOptions,
   signal,
+  hasTools = false,
 }) {
   const encoder = new TextEncoder()
   const accumulated = { value: -1 }
@@ -226,6 +228,17 @@ export function createOpenAiStreamResponse({
         send(chunk)
       }
 
+      const gate = hasTools ? new ToolFenceGate((chunkText) => sendDelta({ ...takeRole(), content: chunkText })) : null
+
+      // The role goes out with the first delta, as OpenAI's own streams do.
+      // Gated content can hold text back, so the role rides whichever delta
+      // leaves first.
+      const takeRole = () => {
+        if (hasSentRole) return {}
+        hasSentRole = true
+        return { role: "assistant" }
+      }
+
       try {
         await readDeepSeekSseStream(upstreamStream, {
           onReady: (reqId, respId) => {
@@ -236,19 +249,22 @@ export function createOpenAiStreamResponse({
               replyChars += text.length
               reply += text
             }
-            const delta = {}
-            if (!hasSentRole) {
-              delta.role = "assistant"
-              hasSentRole = true
+            if (type === "THINK") {
+              sendDelta({ ...takeRole(), reasoning_content: text })
+            } else if (hasTools) {
+              gate.push(text)
+            } else {
+              sendDelta({ ...takeRole(), content: text })
             }
-            if (type === "THINK") delta.reasoning_content = text
-            else delta.content = text
-            sendDelta(delta)
           },
           onUsage: (tokens) => {
             accumulated.value = tokens
           },
         })
+
+        if (hasTools && gate) {
+          gate.flush()
+        }
 
         const { usage, total } = turnUsage({
           accumulated: accumulated.value,
@@ -256,16 +272,38 @@ export function createOpenAiStreamResponse({
           replyChars,
         })
 
-        sendDelta({}, "stop", streamOptions?.include_usage ? usage : null)
+        if (hasTools) {
+          const { toolCalls, cleanText } = parseToolCalls(reply)
+          if (toolCalls.length > 0) {
+            sendDelta({
+              ...takeRole(),
+              tool_calls: toolCalls.map((tc, index) => ({
+                index,
+                id: tc.id,
+                type: "function",
+                function: tc.function,
+              })),
+            })
+            sendDelta({}, "tool_calls", streamOptions?.include_usage ? usage : null)
+            send("[DONE]")
+            controller.close()
+            // The client keeps what it was actually sent, which for a gated
+            // stream is the text the gate let through, not the cleaned text.
+            if (onFinish) onFinish(total, reply, toolCalls, gate?.sent ?? cleanText)
+            return
+          }
+        }
+
+        sendDelta(takeRole(), "stop", streamOptions?.include_usage ? usage : null)
         send("[DONE]")
         controller.close()
-        if (onFinish) onFinish(total, reply)
+        if (onFinish) onFinish(total, reply, null, reply)
       } catch (err) {
         if (signal?.aborted) {
           try {
             controller.close()
           } catch {}
-          if (onFinish) onFinish(accumulated.value, reply)
+          if (onFinish) onFinish(accumulated.value, reply, null)
           return
         }
         // Tell the client what went wrong the way OpenAI's own streams do,
@@ -277,14 +315,14 @@ export function createOpenAiStreamResponse({
         try {
           controller.close()
         } catch {}
-        if (onFinish) onFinish(accumulated.value, reply)
+        if (onFinish) onFinish(accumulated.value, reply, null)
       }
     },
 
     // A client that drops the stream (a stopped agent run) ends the turn too,
     // so the conversation isn't held for it.
     cancel() {
-      if (onFinish) onFinish(accumulated.value, reply)
+      if (onFinish) onFinish(accumulated.value, reply, null)
     },
   })
 
@@ -308,6 +346,7 @@ export async function createOpenAiJsonResponse({
   previousUsage = -1,
   onSessionReady,
   onFinish,
+  hasTools = false,
 }) {
   let content = ""
   let reasoningContent = ""
@@ -331,17 +370,32 @@ export async function createOpenAiJsonResponse({
   })
 
   const { usage, total } = turnUsage({ accumulated, previous: previousUsage, replyChars })
-  if (onFinish) onFinish(total, content)
 
-  const message = { role: "assistant", content }
+  let toolCalls = []
+  let finishReason = "stop"
+  let messageContent = content
+
+  if (hasTools) {
+    const parsed = parseToolCalls(content)
+    if (parsed.toolCalls.length > 0) {
+      toolCalls = parsed.toolCalls
+      finishReason = "tool_calls"
+      messageContent = parsed.cleanText || null
+    }
+  }
+
+  if (onFinish) onFinish(total, content, toolCalls.length > 0 ? toolCalls : null, messageContent ?? "")
+
+  const message = { role: "assistant", content: messageContent }
   if (reasoningContent) message.reasoning_content = reasoningContent
+  if (toolCalls.length > 0) message.tool_calls = toolCalls
 
   const result = {
     id: completionId,
     object: "chat.completion",
     created: createdAt,
     model: modelName,
-    choices: [{ index: 0, message, finish_reason: "stop" }],
+    choices: [{ index: 0, message, finish_reason: finishReason }],
     usage,
   }
 

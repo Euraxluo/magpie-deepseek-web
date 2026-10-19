@@ -67,6 +67,10 @@ export function extractImages(content) {
  * The cache key for "messages except the last one", so a client that appends
  * one exchange per request keeps hitting the same DeepSeek session. The model
  * is part of the key, as DeepSeek keeps one model per session.
+ *
+ * Tool calls are fingerprinted by name and arguments alone: a client sends the
+ * calls back in whatever shape its SDK uses, and id/type orderings differ
+ * between them, but the pair is what the upstream session actually saw.
  */
 export function calculatePrefixKey(messages, modelName) {
   const hash = createHash("sha256")
@@ -74,11 +78,45 @@ export function calculatePrefixKey(messages, modelName) {
     hash.update(String(m?.role ?? ""))
     hash.update("\x1f")
     hash.update(contentFingerprint(m?.content))
+    if (Array.isArray(m?.tool_calls) && m.tool_calls.length > 0) {
+      hash.update("\x1c")
+      for (const tc of m.tool_calls) {
+        const fn = tc?.function ?? tc ?? {}
+        hash.update(String(fn.name ?? ""))
+        hash.update("\x1d")
+        hash.update(normalizeArguments(fn.arguments))
+        hash.update("\x1d")
+      }
+    }
+    if (m?.tool_call_id) {
+      hash.update("\x1b")
+      hash.update(String(m.tool_call_id))
+    }
     hash.update("\x1e")
   }
   hash.update("\x00")
   hash.update(String(modelName || ""))
   return hash.digest("hex").slice(0, 32)
+}
+
+/** Stable text for an arguments value: objects are key-sorted, JSON stays JSON. */
+function normalizeArguments(args) {
+  if (typeof args === "string") {
+    try {
+      return JSON.stringify(sortKeys(JSON.parse(args)))
+    } catch {
+      return args
+    }
+  }
+  return JSON.stringify(sortKeys(args ?? null))
+}
+
+function sortKeys(value) {
+  if (Array.isArray(value)) return value.map(sortKeys)
+  if (!value || typeof value !== "object") return value
+  const out = {}
+  for (const key of Object.keys(value).sort()) out[key] = sortKeys(value[key])
+  return out
 }
 
 /**

@@ -14,6 +14,13 @@ import {
   createOpenAiStreamResponse,
   newCompletionId,
 } from "./sse.mjs"
+import {
+  buildAnchorPrompt,
+  buildToolsPrompt,
+  formatToolCallsToToml,
+  formatToolResult,
+  parseToolCalls,
+} from "./toml.mjs"
 
 const convStore = new ConversationStore({ maxSize: 100, ttlMs: 30 * 60 * 1000 })
 
@@ -91,6 +98,101 @@ async function conversationFor({ messages, modelId, conversationId, client, toke
   }
 }
 
+function findLastAssistantIndex(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    if (messages[i]?.role === "assistant") return i
+  }
+  return -1
+}
+
+function buildTurnPrompt({ messages, tools, toolChoice, fresh }) {
+  const hasTools = Array.isArray(tools) && tools.length > 0 && toolChoice !== "none"
+  const lastAssistantIdx = findLastAssistantIndex(messages)
+
+  const newMessages =
+    lastAssistantIdx >= 0
+      ? messages.slice(lastAssistantIdx + 1)
+      : messages.filter((m) => m?.role !== "system" && m?.role !== "developer")
+
+  const turnParts = []
+  const turnImages = []
+
+  for (const msg of newMessages) {
+    const role = msg?.role
+    if (role === "tool") {
+      const text = extractText(msg.content)
+      turnParts.push(formatToolResult(msg.name || msg.tool_call_id, text))
+    } else if (role === "user") {
+      const text = extractText(msg.content)
+      if (text) turnParts.push(text)
+      const imgs = extractImages(msg.content)
+      if (imgs.length > 0) turnImages.push(...imgs)
+    }
+  }
+
+  let prompt = turnParts.join("\n\n")
+
+  if (fresh) {
+    const systemParts = []
+    for (const msg of messages) {
+      if (msg?.role === "system" || msg?.role === "developer") {
+        const text = extractText(msg.content)
+        if (text) systemParts.push(text)
+      }
+    }
+
+    if (hasTools) {
+      const toolsPrompt = buildToolsPrompt(tools, toolChoice)
+      if (toolsPrompt) systemParts.push(toolsPrompt)
+    }
+
+    const historyParts = []
+    if (lastAssistantIdx >= 0) {
+      for (let i = 0; i <= lastAssistantIdx; i++) {
+        const m = messages[i]
+        const role = m?.role
+        if (role === "user") {
+          const t = extractText(m.content)
+          if (t) historyParts.push(`[User]: ${t}`)
+        } else if (role === "assistant") {
+          if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+            const prefix = extractText(m.content) ? `[Assistant]: ${extractText(m.content)}\n` : "[Assistant]:\n"
+            historyParts.push(prefix + formatToolCallsToToml(m.tool_calls))
+          } else {
+            const t = extractText(m.content)
+            if (t) historyParts.push(`[Assistant]: ${t}`)
+          }
+        } else if (role === "tool") {
+          historyParts.push(formatToolResult(m.name || m.tool_call_id, extractText(m.content)))
+        }
+      }
+    }
+
+    const fullParts = []
+    if (systemParts.length > 0) {
+      fullParts.push(`[System]\n${systemParts.join("\n\n")}\n[/System]`)
+    }
+    if (historyParts.length > 0) {
+      fullParts.push(historyParts.join("\n\n"))
+    }
+    if (prompt) {
+      fullParts.push(prompt)
+    }
+
+    prompt = fullParts.join("\n\n")
+  }
+
+  // The anchor rides every turn, not just the first: a long agent prompt can
+  // bury the tool format, and the last line of the prompt carries the most
+  // weight with the web models.
+  if (hasTools) {
+    const anchor = buildAnchorPrompt(tools, toolChoice)
+    if (anchor) prompt = prompt ? `${prompt}\n\n${anchor}` : anchor
+  }
+
+  return { prompt, images: turnImages }
+}
+
 /**
  * OpenCode and Magpie provider plugin for DeepSeek's web chat
  * (chat.deepseek.com), with the browser's own userToken as the credential.
@@ -108,7 +210,13 @@ export async function DeepSeekWebPlugin({ client } = {}) {
         models: Object.fromEntries(
           Object.entries(MODELS).map(([id, m]) => [
             id,
-            { name: m.name, limit: m.limit, modalities: m.modalities },
+            {
+              name: m.name,
+              limit: m.limit,
+              modalities: m.modalities,
+              tool_call: true,
+              attachment: m.attachment,
+            },
           ])
         ),
       }
@@ -169,24 +277,21 @@ export async function DeepSeekWebPlugin({ client } = {}) {
             const model = resolveModel(body.model)
             const messages = body.messages
             const stream = Boolean(body.stream)
+            const tools = Array.isArray(body.tools) ? body.tools : []
+            const toolChoice = body.tool_choice
+            const hasTools = tools.length > 0 && toolChoice !== "none"
 
-            // The web client takes one prompt per turn: the last user message.
-            // What came before lives in the upstream session, or in the system
-            // block a fresh session is opened with.
-            const systemParts = []
-            let prompt = ""
-            let images = []
-            for (const msg of messages) {
-              if (msg?.role === "system" || msg?.role === "developer") {
-                const text = extractText(msg.content)
-                if (text) systemParts.push(text)
-              } else if (msg?.role === "user") {
-                prompt = extractText(msg.content)
-                images = extractImages(msg.content)
-              }
-            }
-            if (!prompt.trim() && images.length === 0) {
-              return errorResponse(400, "invalid_request_error", "messages must contain a user message with text or images")
+            // A turn needs something to say: the user's message, or a tool
+            // result an agent is handing back. Images alone count too.
+            const lastAssistantIdx = findLastAssistantIndex(messages)
+            const turnMessages = messages
+              .slice(lastAssistantIdx + 1)
+              .filter((m) => m?.role !== "system" && m?.role !== "developer")
+            const images = turnMessages.flatMap((m) => extractImages(m?.content))
+            const hasTurnContent =
+              images.length > 0 || turnMessages.some((m) => extractText(m?.content).trim() !== "")
+            if (!hasTurnContent) {
+              return errorResponse(400, "invalid_request_error", "messages must contain user or tool content")
             }
 
             try {
@@ -220,9 +325,12 @@ export async function DeepSeekWebPlugin({ client } = {}) {
                   }
                 }
 
-                if (fresh && systemParts.length > 0) {
-                  prompt = `[System]\n${systemParts.join("\n\n")}\n[/System]\n\n${prompt}`
-                }
+                const { prompt } = buildTurnPrompt({
+                  messages,
+                  tools,
+                  toolChoice,
+                  fresh,
+                })
 
                 const previousUsage = conv.hasUsage ? conv.lastUsage : -1
 
@@ -252,12 +360,22 @@ export async function DeepSeekWebPlugin({ client } = {}) {
                 // partial stream: `ready` already advanced the parent id, so a
                 // follow-up can chain from here.
                 let finished = false
-                const onFinish = (total, reply) => {
+                const onFinish = (total, reply, toolCalls, shownText) => {
                   if (finished) return
                   finished = true
                   conv.usageBefore(total)
+                  // The next request carries this assistant turn back as the
+                  // client was shown it — the fence stripped, whatever text
+                  // survived the gate — so the registered key is built from
+                  // exactly that. The raw reply only stands in where a client
+                  // streams by re-reading the whole answer.
+                  const shown = toolCalls?.length ? (shownText ?? parseToolCalls(reply).cleanText) : reply
+                  const assistantMsg = { role: "assistant", content: shown }
+                  if (toolCalls && toolCalls.length > 0) {
+                    assistantMsg.tool_calls = toolCalls
+                  }
                   const key = calculatePrefixKey(
-                    [...messages, { role: "assistant", content: reply }],
+                    [...messages, assistantMsg],
                     model.id
                   )
                   convStore.register(key, conv)
@@ -276,6 +394,7 @@ export async function DeepSeekWebPlugin({ client } = {}) {
                     onFinish,
                     streamOptions: body.stream_options,
                     signal,
+                    hasTools,
                   })
                 }
                 return createOpenAiJsonResponse({
@@ -286,6 +405,7 @@ export async function DeepSeekWebPlugin({ client } = {}) {
                   previousUsage,
                   onSessionReady,
                   onFinish,
+                  hasTools,
                 })
               } catch (err) {
                 release()
@@ -345,6 +465,7 @@ export const _internal = {
   conversationFor,
   mapUpstreamError,
   normalizeUserToken,
+  buildTurnPrompt,
   PROVIDER_ID,
   MODELS,
 }

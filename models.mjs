@@ -7,7 +7,9 @@ export const PROVIDER_NAME = "DeepSeek Web"
 const MODEL = {
   release_date: "2026-04-01",
   attachment: true,
-  tool_call: false,
+  // The web client has no protocol-level tool calling; the plugin asks the
+  // model for TOML ```tool_call blocks and parses them out of the text.
+  tool_call: true,
   limit: { context: 128_000, output: 8_000 },
   modalities: { input: ["text", "image"], output: ["text"] },
 }

@@ -353,3 +353,149 @@ test("no token means no loader config", async () => {
   assert.deepEqual(await hooks.auth.loader(async () => null), {})
   assert.deepEqual(await hooks.auth.loader(async () => ({ type: "api", key: "" })), {})
 })
+
+test("a TOML tool call in a streamed reply becomes tool_calls, and the fence never reaches content", async () => {
+  const text = sseText([
+    "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n",
+    'data: {"v":{"response":{"fragments":[{"id":2,"type":"RESPONSE","content":"Let me check.\\n\\n```tool_"}]}}}\n\n',
+    'data: {"v":"call\\nname = \\"run_command\\"\\n\\n[parameters]\\ncommand = \\"ls -la\\"\\n```"}\n\n',
+    'data: {"p":"response/accumulated_token_usage","v":60}\n\n',
+    "event: close\ndata: {}\n\n",
+  ])
+
+  let finished = null
+  const res = await createOpenAiStreamResponse({
+    upstreamStream: streamOf(text),
+    completionId: "chatcmpl-t1",
+    modelName: "deepseek-chat",
+    createdAt: 1700000000,
+    hasTools: true,
+    onFinish: (total, reply, calls) => (finished = { total, reply, calls }),
+  })
+
+  const data = await readAll(res)
+  assert.equal(data.at(-1), "[DONE]")
+  const chunks = data.slice(0, -1).map((d) => JSON.parse(d))
+  const content = chunks.map((c) => c.choices[0]?.delta?.content ?? "").join("")
+  assert.equal(content, "Let me check.\n\n")
+  assert.ok(!content.includes("tool_call"))
+
+  const toolChunk = chunks.find((c) => c.choices[0]?.delta?.tool_calls)
+  assert.ok(toolChunk)
+  const call = toolChunk.choices[0].delta.tool_calls[0]
+  assert.equal(call.type, "function")
+  assert.equal(call.function.name, "run_command")
+  assert.deepEqual(JSON.parse(call.function.arguments), { command: "ls -la" })
+
+  assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls")
+  assert.equal(finished.calls.length, 1)
+})
+
+test("a non-streaming TOML tool call becomes message.tool_calls with finish_reason tool_calls", async () => {
+  const text = sseText([
+    "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n",
+    'data: {"v":{"response":{"fragments":[{"id":2,"type":"RESPONSE","content":"```tool_call\\nname = \\"read_file\\"\\n\\n[parameters]\\npath = \\"a.txt\\"\\n```"}]}}}\n\n',
+    'data: {"p":"response/accumulated_token_usage","v":30}\n\n',
+    "event: close\ndata: {}\n\n",
+  ])
+
+  const res = await createOpenAiJsonResponse({
+    upstreamStream: streamOf(text),
+    completionId: "chatcmpl-t2",
+    modelName: "deepseek-chat",
+    createdAt: 1700000000,
+    hasTools: true,
+  })
+  const json = await res.json()
+  assert.equal(json.choices[0].finish_reason, "tool_calls")
+  assert.equal(json.choices[0].message.content, null)
+  assert.equal(json.choices[0].message.tool_calls[0].function.name, "read_file")
+  assert.deepEqual(JSON.parse(json.choices[0].message.tool_calls[0].function.arguments), { path: "a.txt" })
+})
+
+test("a prompt for a fresh session carries tool instructions and the anchor in TOML", async () => {
+  const { _internal } = await import("./index.mjs")
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "run_command",
+        description: "Run a shell command",
+        parameters: { type: "object", properties: { command: { type: "string" } } },
+      },
+    },
+  ]
+  const { prompt, images } = _internal.buildTurnPrompt({
+    messages: [
+      { role: "system", content: "You are a coding agent." },
+      { role: "user", content: "list the files" },
+    ],
+    tools,
+    toolChoice: "auto",
+    fresh: true,
+  })
+  assert.equal(images.length, 0)
+  assert.match(prompt, /You are a coding agent\./)
+  assert.match(prompt, /parameter[s]? in TOML format/)
+  assert.match(prompt, /System instruction — highest priority/)
+  assert.match(prompt, /name = "run_command"/)
+  assert.match(prompt, /list the files/)
+  // the anchor is last, where a web model weights it most
+  assert.ok(prompt.indexOf("highest priority") > prompt.indexOf("list the files"))
+})
+
+test("after a tool call, the next turn sends the tool result and the tools anchor, not the history", async () => {
+  const { _internal } = await import("./index.mjs")
+  const tools = [{ type: "function", function: { name: "run_command", parameters: {} } }]
+  const messages = [
+    { role: "system", content: "You are a coding agent." },
+    { role: "user", content: "list the files" },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        { id: "call_1", type: "function", function: { name: "run_command", arguments: '{"command":"ls"}' } },
+      ],
+    },
+    { role: "tool", tool_call_id: "call_1", name: "run_command", content: "Process exited with code 0\nOutput:\na.txt" },
+  ]
+
+  const { prompt } = _internal.buildTurnPrompt({ messages, tools, toolChoice: "auto", fresh: false })
+  assert.match(prompt, /Tool result for run_command/)
+  assert.match(prompt, /a\.txt/)
+  assert.ok(!prompt.includes("list the files"), "history belongs to the upstream session, not this turn")
+  assert.match(prompt, /highest priority/)
+})
+
+test("a fresh session rebuilds prior tool calls as TOML blocks", async () => {
+  const { _internal } = await import("./index.mjs")
+  const tools = [{ type: "function", function: { name: "run_command", parameters: {} } }]
+  const messages = [
+    { role: "system", content: "agent" },
+    { role: "user", content: "list the files" },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        { id: "call_1", type: "function", function: { name: "run_command", arguments: '{"command":"ls"}' } },
+      ],
+    },
+    { role: "tool", tool_call_id: "call_1", name: "run_command", content: "a.txt" },
+    { role: "user", content: "now read a.txt" },
+  ]
+  const { prompt } = _internal.buildTurnPrompt({ messages, tools, toolChoice: "auto", fresh: true })
+  assert.match(prompt, /```tool_call\nname = "run_command"/)
+  assert.match(prompt, /command = "ls"/)
+  assert.match(prompt, /Tool result for run_command/)
+  assert.match(prompt, /now read a\.txt/)
+})
+
+test("prefix keys ignore id and shape differences in tool calls", () => {
+  const a = [
+    { role: "assistant", content: null, tool_calls: [{ id: "call_1", type: "function", function: { name: "x", arguments: '{"a":1,"b":2}' } }] },
+  ]
+  const b = [
+    { role: "assistant", content: null, tool_calls: [{ function: { name: "x", arguments: { b: 2, a: 1 } } }] },
+  ]
+  assert.equal(calculatePrefixKey(a, "m"), calculatePrefixKey(b, "m"))
+})
