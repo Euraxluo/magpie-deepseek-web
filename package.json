@@ -1,0 +1,39 @@
+{
+  "name": "@euraxluo/magpie-deepseek-web",
+  "version": "0.1.0",
+  "description": "DeepSeek Web provider for magpie/OpenCode before the community PR lands (see PR magpie-community/plugins#247)",
+  "type": "module",
+  "main": "./index.mjs",
+  "exports": "./index.mjs",
+  "files": [
+    "index.mjs",
+    "auth.mjs",
+    "pow.mjs",
+    "client.mjs",
+    "sse.mjs",
+    "conv.mjs",
+    "models.mjs",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "opencode",
+    "opencode-plugin",
+    "deepseek",
+    "deepseek-web",
+    "deepseek-r1",
+    "deepseek-v3",
+    "magpie"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Euraxluo/magpie-deepseek-web.git"
+  },
+  "scripts": {
+    "test": "bun test"
+  },
+  "magpie": {
+    "icon": "data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHZpZXdCb3g9IjAgMCAyNCAyNCI+PHBhdGggZmlsbD0iIzRENkRGRiIgZD0iTTEyIDJhMTAgMTAgMCAxIDAgMCAyMCAxMCAxMCAwIDAgMCAwLTIweiIvPjxwYXRoIGZpbGw9IiNmZmYiIGQ9Ik03LjUgMTJjMC0yLjUgMi00LjUgNC41LTQuNXMyLjQgMS4yIDMuNCAyLjZsLTEuOS0xLjEtMi0xLTIgMiAyIDJoLTJ6Ii8+PC9zdmc+"
+  }
+}
