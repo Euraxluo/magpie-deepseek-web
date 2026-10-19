@@ -412,6 +412,57 @@ test("sanitizeArgumentValue and normalizeSingleToolCall clean hallucinated XML p
   assert.equal(parsed[0].arguments.command, "find src -type f | wc -l")
 })
 
+test("base64 payload accepts Codex and Claude Code standard call shapes", () => {
+  // 1. Codex standard { name, arguments }
+  const codexDoc = { name: "bash", arguments: { command: "git status" } }
+  const codexB64 = Buffer.from(JSON.stringify(codexDoc)).toString("base64")
+  const p1 = parseBase64ToolCall(codexB64)
+  assert.equal(p1.length, 1)
+  assert.equal(p1[0].name, "bash")
+  assert.deepEqual(p1[0].arguments, { command: "git status" })
+
+  // 2. OpenAI function wrapper { type: "function", function: { name, arguments } }
+  const openAiDoc = {
+    type: "function",
+    id: "call_123",
+    function: { name: "bash", arguments: JSON.stringify({ command: "git diff" }) },
+  }
+  const openAiB64 = Buffer.from(JSON.stringify(openAiDoc)).toString("base64")
+  const p2 = parseBase64ToolCall(openAiB64)
+  assert.equal(p2.length, 1)
+  assert.equal(p2[0].name, "bash")
+  assert.deepEqual(p2[0].arguments, { command: "git diff" })
+
+  // 3. Claude Code standard { type: "tool_use", id, name, input }
+  const claudeDoc = {
+    type: "tool_use",
+    id: "toolu_01AbCdEfGhIjKlMnOpQrSt",
+    name: "bash",
+    input: { command: "npm test" },
+  }
+  const claudeB64 = Buffer.from(JSON.stringify(claudeDoc)).toString("base64")
+  const p3 = parseBase64ToolCall(claudeB64)
+  assert.equal(p3.length, 1)
+  assert.equal(p3[0].name, "bash")
+  assert.deepEqual(p3[0].arguments, { command: "npm test" })
+
+  // 4. Claude XML inside base64: <tool_use><name>...</name><input>...</input></tool_use>
+  const claudeXml = "<tool_use>\n<name>read_file</name>\n<input>{\"path\": \"src/app.ts\"}</input>\n</tool_use>"
+  const xmlB64 = Buffer.from(claudeXml).toString("base64")
+  const p4 = parseBase64ToolCall(xmlB64)
+  assert.equal(p4.length, 1)
+  assert.equal(p4[0].name, "read_file")
+  assert.deepEqual(p4[0].arguments, { path: "src/app.ts" })
+
+  // 5. Claude Invoke XML inside base64: <invoke name="..."><parameter name="...">...</parameter></invoke>
+  const invokeXml = '<invoke name="bash"><parameter name="command">ls -lh</parameter></invoke>'
+  const invokeB64 = Buffer.from(invokeXml).toString("base64")
+  const p5 = parseBase64ToolCall(invokeB64)
+  assert.equal(p5.length, 1)
+  assert.equal(p5[0].name, "bash")
+  assert.deepEqual(p5[0].arguments, { command: "ls -lh" })
+})
+
 test("the base64 prompts show a real encoded example and forbid JSON in the reply", () => {
   const prompt = buildBase64ToolsPrompt(b64Tools, "auto")
   assert.match(prompt, /Encode that exact JSON text as base64/)

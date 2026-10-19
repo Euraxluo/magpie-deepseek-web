@@ -429,9 +429,13 @@ export function parseToolCalls(text) {
 export function normalizeTomlToolCalls(parsed) {
   if (!parsed || typeof parsed !== "object") return []
 
+  if (Array.isArray(parsed)) {
+    return parsed.map((item) => normalizeSingleToolCall(item)).filter(Boolean)
+  }
+
   const list = parsed.tool_calls || parsed.tool_call
   if (Array.isArray(list)) {
-    return list.map(item => normalizeSingleToolCall(item)).filter(Boolean)
+    return list.map((item) => normalizeSingleToolCall(item)).filter(Boolean)
   }
 
   if (parsed.tool_call && typeof parsed.tool_call === "object" && !Array.isArray(parsed.tool_call)) {
@@ -486,30 +490,64 @@ export function sanitizeArgumentObject(obj) {
 
 function normalizeSingleToolCall(item) {
   if (!item || typeof item !== "object") return null
-  const name = item.name || item.function || item.tool
+  const fnObj = item.function && typeof item.function === "object" ? item.function : null
+  const name =
+    item.name ||
+    fnObj?.name ||
+    (typeof item.function === "string" ? item.function : null) ||
+    item.tool
   if (!name || typeof name !== "string") return null
 
+  // Accepts arguments across Codex (arguments/parameters) and Claude Code (input)
+  let rawArgs =
+    item.input ??
+    item.arguments ??
+    item.parameters ??
+    item.args ??
+    fnObj?.arguments ??
+    fnObj?.input ??
+    fnObj?.parameters
+
   let args = {}
-  if (item.parameters && typeof item.parameters === "object" && !Array.isArray(item.parameters)) {
-    args = item.parameters
-  } else if (item.arguments && typeof item.arguments === "object" && !Array.isArray(item.arguments)) {
-    args = item.arguments
-  } else if (item.args && typeof item.args === "object" && !Array.isArray(item.args)) {
-    args = item.args
+  if (rawArgs && typeof rawArgs === "object" && !Array.isArray(rawArgs)) {
+    args = rawArgs
+  } else if (typeof rawArgs === "string") {
+    try {
+      const parsed = JSON.parse(rawArgs)
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        args = parsed
+      } else {
+        args = rawArgs
+      }
+    } catch {
+      args = rawArgs
+    }
   } else {
     const remaining = {}
     for (const [k, v] of Object.entries(item)) {
-      if (k !== "name" && k !== "id" && k !== "type" && k !== "function" && k !== "tool") {
+      if (
+        k !== "name" &&
+        k !== "id" &&
+        k !== "type" &&
+        k !== "function" &&
+        k !== "tool" &&
+        k !== "input"
+      ) {
         remaining[k] = v
       }
     }
     args = remaining
   }
 
+  const sanitized =
+    typeof args === "object" && args !== null
+      ? sanitizeArgumentObject(args)
+      : sanitizeArgumentValue(args)
+
   return {
     id: item.id || `call_${randomBytes(8).toString("hex")}`,
     name: name.trim(),
-    arguments: sanitizeArgumentObject(args),
+    arguments: sanitized,
   }
 }
 
@@ -823,6 +861,52 @@ export function looksBase64(block) {
 }
 
 /**
+ * Parses Claude Code / Anthropic style XML tool use inside decoded content:
+ * <tool_use><name>...</name><input>...</input></tool_use> or
+ * <invoke name="..."><parameter name="...">...</parameter></invoke>.
+ */
+export function parseXmlToolCalls(text) {
+  if (!text || typeof text !== "string") return []
+  const calls = []
+
+  // Anthropic / Claude Code style: <tool_use><name>tool</name><input>...</input></tool_use>
+  const toolUseMatches = [...text.matchAll(/<tool_use>([\s\S]*?)<\/tool_use>/gi)]
+  for (const m of toolUseMatches) {
+    const inner = m[1]
+    const nameMatch = inner.match(/<name>([\s\S]*?)<\/name>/i)
+    const name = nameMatch ? nameMatch[1].trim() : ""
+    if (!name) continue
+    const inputMatch = inner.match(/<input>([\s\S]*?)<\/input>/i)
+    let args = {}
+    if (inputMatch) {
+      const rawInput = inputMatch[1].trim()
+      try {
+        args = JSON.parse(rawInput)
+      } catch {
+        const tags = [...rawInput.matchAll(/<([a-zA-Z0-9_-]+)>([\s\S]*?)<\/\1>/g)]
+        for (const t of tags) args[t[1]] = t[2].trim()
+      }
+    }
+    calls.push({ name, arguments: args })
+  }
+  if (calls.length > 0) return calls
+
+  // Invoke style: <invoke name="tool_name"><parameter name="key">val</parameter></invoke>
+  const invokeMatches = [...text.matchAll(/<invoke\s+name=["']([^"']+)["']>([\s\S]*?)<\/invoke>/gi)]
+  for (const m of invokeMatches) {
+    const name = m[1].trim()
+    const inner = m[2]
+    const args = {}
+    const params = [...inner.matchAll(/<parameter\s+name=["']([^"']+)["']>([\s\S]*?)<\/parameter>/gi)]
+    for (const p of params) {
+      args[p[1]] = p[2].trim()
+    }
+    calls.push({ name, arguments: args })
+  }
+  return calls
+}
+
+/**
  * Decodes a base64 block into a tool call. Returns null when the text is not
  * base64, does not decode to UTF-8, or decodes to something with no tool call
  * in it — so a caller can tell "not this format" from "this format, bad call".
@@ -845,6 +929,13 @@ export function parseBase64ToolCall(block) {
   try {
     parsed = JSON.parse(text)
   } catch {
+    // If the base64 payload decodes to Claude Code XML tool use
+    const xmlCalls = parseXmlToolCalls(text)
+    if (xmlCalls.length > 0) {
+      const norm = normalizeJsonToolCalls(xmlCalls)
+      if (norm.length > 0) return norm
+    }
+
     // Some models add the name on a line before the encoded JSON; take the
     // longest base64-looking run and try that alone.
     const runs = text.match(/[A-Za-z0-9+/=_-]{16,}/g) || []
@@ -971,8 +1062,10 @@ export function buildBase64ToolsPrompt(tools, toolChoice) {
   return (
     `[System instruction]: You have access to the following tools:\n` +
     `\`\`\`json\n${JSON.stringify(defs, null, 2)}\n\`\`\`\n\n` +
-    `To call a tool, do NOT write JSON or TOML in your reply. Encode the call and send only the encoding:\n` +
-    `1. Build this JSON object: {"name": "<tool name>", "arguments": {<the tool's arguments>}}\n` +
+    `To call a tool, do NOT write JSON or TOML in your reply. Encode the call as base64 and send only the encoding:\n` +
+    `1. Build the tool call in standard Codex or Claude Code JSON format:\n` +
+    `   Codex: {"name": "<tool name>", "arguments": {<the tool's arguments>}}\n` +
+    `   Claude Code: {"type": "tool_use", "name": "<tool name>", "input": {<the tool's arguments>}}\n` +
     `2. Encode that exact JSON text as base64 (UTF-8).\n` +
     `3. Reply with one fenced block, the tag \`tool_call_base64\` and the encoded text alone:\n\n` +
     `${sample}\n\n` +
