@@ -499,3 +499,88 @@ test("prefix keys ignore id and shape differences in tool calls", () => {
   ]
   assert.equal(calculatePrefixKey(a, "m"), calculatePrefixKey(b, "m"))
 })
+
+test("the loader turns a tools request into a TOML prompt upstream and tool_calls back", async () => {
+  const calls = []
+  const realFetch = globalThis.fetch
+  globalThis.fetch = async (url, init) => {
+    const u = String(url)
+    calls.push({ url: u, init })
+    if (u.endsWith("/api/v0/chat/create_pow_challenge")) {
+      // the same vector the solver tests use
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          data: {
+            biz_data: {
+              challenge: {
+                algorithm: "DeepSeekHashV1",
+                challenge: "168efa309e5a73033fc82dde4333bbc6515da440ef961574f73f99cbe7b397ad",
+                salt: "a40318e6b7af56bf27cf",
+                expire_at: 1790959021012,
+                signature: "sig",
+                target_path: "/api/v0/chat/completion",
+              },
+            },
+          },
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      )
+    }
+    if (u.endsWith("/api/v0/chat_session/create")) {
+      return new Response(JSON.stringify({ code: 0, data: { biz_data: { chat_session: { id: "sess-1" } } } }), {
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+    if (u.endsWith("/api/v0/chat/completion")) {
+      const sse = [
+        "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n",
+        'data: {"v":{"response":{"fragments":[{"id":2,"type":"RESPONSE","content":"```tool_call\\nname = \\"run_command\\"\\n\\n[parameters]\\ncommand = \\"ls -la\\"\\n```"}]}}}\n\n',
+        'data: {"p":"response/accumulated_token_usage","v":40}\n\n',
+        "event: close\ndata: {}\n\n",
+      ].join("")
+      return new Response(streamOf(sse), { headers: { "Content-Type": "text/event-stream" } })
+    }
+    return new Response("not found", { status: 404 })
+  }
+
+  try {
+    const { default: plugin, _internal } = await import("./index.mjs")
+    _internal.convStore.clear?.()
+    const hooks = await plugin({ client: {} })
+    const loaded = await hooks.auth.loader(async () => ({ type: "api", key: "tok" }))
+
+    const res = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        stream: false,
+        messages: [{ role: "user", content: "list the files" }],
+        tools: [
+          {
+            type: "function",
+            function: {
+              name: "run_command",
+              description: "Run a shell command",
+              parameters: { type: "object", properties: { command: { type: "string" } } },
+            },
+          },
+        ],
+      }),
+    })
+
+    const json = await res.json()
+    assert.equal(json.choices[0].finish_reason, "tool_calls")
+    assert.equal(json.choices[0].message.tool_calls[0].function.name, "run_command")
+    assert.deepEqual(JSON.parse(json.choices[0].message.tool_calls[0].function.arguments), { command: "ls -la" })
+
+    const upstream = calls.find((c) => c.url.endsWith("/api/v0/chat/completion"))
+    const body = JSON.parse(upstream.init.body)
+    assert.match(body.prompt, /parameters in TOML format/)
+    assert.match(body.prompt, /highest priority/)
+    assert.match(body.prompt, /run_command/)
+    assert.equal(body.session_id, undefined)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})

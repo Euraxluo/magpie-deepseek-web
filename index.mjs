@@ -32,7 +32,12 @@ function keepSweeping() {
   if (sweeper) return
   sweeper = (async () => {
     while (convStore.size > 0) {
-      await new Promise((r) => setTimeout(r, 60 * 1000))
+      // `unref` so an idle sweep never keeps a short-lived process (a CLI
+      // run, a test) alive just because one conversation was registered.
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, 60 * 1000)
+        timer.unref?.()
+      })
       await convStore.sweep().catch(() => {})
     }
     sweeper = null
