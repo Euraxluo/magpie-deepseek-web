@@ -244,3 +244,42 @@ test("parseToolChoice parses string, object and none", () => {
     { mode: "required", forced: "my_func" }
   )
 })
+
+test("dotted keys and a JSON fallback still make a call", () => {
+  const dotted = parseToolCalls('```tool_call\nname = "run"\nparameters.command = "ls -l"\nparameters.flag = true\n```')
+  assert.equal(dotted.toolCalls.length, 1)
+  assert.deepEqual(JSON.parse(dotted.toolCalls[0].function.arguments), { command: "ls -l", flag: true })
+
+  // a model that ignores the TOML instruction and writes JSON in the fence
+  const json = parseToolCalls('```tool_call\n{"name": "read_file", "arguments": {"path": "a.txt"}}\n```')
+  assert.equal(json.toolCalls.length, 1)
+  assert.equal(json.toolCalls[0].function.name, "read_file")
+  assert.deepEqual(JSON.parse(json.toolCalls[0].function.arguments), { path: "a.txt" })
+})
+
+test("an unclosed fence is released rather than lost", () => {
+  const emitted = []
+  const gate = new ToolFenceGate((c) => emitted.push(c))
+  gate.push("All done. ")
+  gate.push("```tool_call\nname = \"half")
+  gate.flush()
+  assert.equal(emitted.join(""), "All done. ```tool_call\nname = \"half")
+})
+
+test("toml_tool_call fences are gated and parsed too", () => {
+  const text = 'Hi\n```toml_tool_call\nname = "x"\n```\nBye'
+  const { cleanText, toolCalls } = parseToolCalls(text)
+  assert.equal(cleanText, "Hi\n\nBye")
+  assert.equal(toolCalls[0].function.name, "x")
+})
+
+test("the anchor lists the tool names for a continuing turn", () => {
+  const anchor = buildAnchorPrompt(
+    [
+      { type: "function", function: { name: "run_command" } },
+      { type: "function", function: { name: "read_file" } },
+    ],
+    "auto"
+  )
+  assert.match(anchor, /Available tools: run_command, read_file\./)
+})

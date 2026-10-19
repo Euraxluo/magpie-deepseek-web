@@ -71,14 +71,24 @@ export function parseTomlFallback(src) {
     const eqIdx = line.indexOf("=")
     if (eqIdx < 0) continue
     const rawKey = line.slice(0, eqIdx).trim()
-    const key = rawKey.replace(/^['"]|['"]$/g, "")
     let valStr = stripInlineComment(line.slice(eqIdx + 1).trim())
+
+    // Dotted keys (`parameters.command = "ls"`) name a nested table; models
+    // emit them when they forget the `[parameters]` header.
+    const keyPath = splitDottedKey(rawKey)
+    let target = currentTable
+    for (let p = 0; p < keyPath.length - 1; p++) {
+      const seg = keyPath[p]
+      if (!target[seg] || typeof target[seg] !== "object" || Array.isArray(target[seg])) target[seg] = {}
+      target = target[seg]
+    }
+    const key = keyPath[keyPath.length - 1]
 
     // Multi-line basic string: """
     if (valStr.startsWith('"""')) {
       let strContent = valStr.slice(3)
       if (strContent.endsWith('"""') && strContent.length >= 3) {
-        currentTable[key] = unescapeBasicString(strContent.slice(0, -3))
+        target[key] = unescapeBasicString(strContent.slice(0, -3))
       } else {
         const parts = [strContent]
         let closed = false
@@ -94,7 +104,7 @@ export function parseTomlFallback(src) {
             parts.push(nextLine)
           }
         }
-        currentTable[key] = unescapeBasicString(parts.join("\n"))
+        target[key] = unescapeBasicString(parts.join("\n"))
       }
       continue
     }
@@ -103,7 +113,7 @@ export function parseTomlFallback(src) {
     if (valStr.startsWith("'''")) {
       let strContent = valStr.slice(3)
       if (strContent.endsWith("'''") && strContent.length >= 3) {
-        currentTable[key] = trimLeadingNewline(strContent.slice(0, -3))
+        target[key] = trimLeadingNewline(strContent.slice(0, -3))
       } else {
         const parts = [strContent]
         while (i < lines.length) {
@@ -117,7 +127,7 @@ export function parseTomlFallback(src) {
             parts.push(nextLine)
           }
         }
-        currentTable[key] = trimLeadingNewline(parts.join("\n"))
+        target[key] = trimLeadingNewline(parts.join("\n"))
       }
       continue
     }
@@ -134,10 +144,39 @@ export function parseTomlFallback(src) {
       valStr = parts.join(" ")
     }
 
-    currentTable[key] = parseTomlValue(valStr)
+    target[key] = parseTomlValue(valStr)
   }
 
   return root
+}
+
+/**
+ * Splits a possibly dotted key into its segments, respecting quoted segments.
+ */
+function splitDottedKey(rawKey) {
+  const key = rawKey.trim()
+  if (!key.includes(".")) return [key.replace(/^['"]|['"]$/g, "")]
+
+  const segments = []
+  let current = ""
+  let quote = ""
+  for (let i = 0; i < key.length; i++) {
+    const ch = key[i]
+    if (quote) {
+      current += ch
+      if (ch === quote && key[i - 1] !== "\\") quote = ""
+    } else if (ch === '"' || ch === "'") {
+      quote = ch
+      current += ch
+    } else if (ch === ".") {
+      segments.push(current.trim().replace(/^['"]|['"]$/g, ""))
+      current = ""
+    } else {
+      current += ch
+    }
+  }
+  segments.push(current.trim().replace(/^['"]|['"]$/g, ""))
+  return segments.length > 1 ? segments : [key.replace(/^['"]|['"]$/g, "")]
 }
 
 /**
@@ -456,6 +495,7 @@ export class ToolFenceGate {
     this.emit = emit
     this.buf = ""
     this.inFence = false
+    this.openMarker = ""
     this.sent = ""
   }
 
@@ -473,6 +513,7 @@ export class ToolFenceGate {
         if (j < 0) return // In fence, hold back until closing fence arrives
         this.buf = this.buf.slice(j + CLOSE_MARKER.length)
         this.inFence = false
+        this.openMarker = ""
         continue
       }
       const open = earliestMarker(this.buf, OPEN_MARKERS)
@@ -480,6 +521,7 @@ export class ToolFenceGate {
         this.send(this.buf.slice(0, open.index))
         this.buf = this.buf.slice(open.index + open.marker.length)
         this.inFence = true
+        this.openMarker = open.marker
         continue
       }
       const keep = Math.max(...OPEN_MARKERS.map((m) => partialPrefixLen(this.buf, m)))
@@ -495,16 +537,17 @@ export class ToolFenceGate {
   }
 
   /**
-   * Releases whatever is still buffered — a fence the model never closed is
-   * sent as it is, since there is nothing to parse and dropping it would
-   * lose the only answer there is.
+   * Releases whatever is still buffered. A fence the model never closed is
+   * sent with its opening marker, since there is nothing to parse and
+   * dropping it would lose the only answer there is.
    */
   flush() {
-    if (this.buf) {
-      this.send(this.buf)
-      this.buf = ""
-    }
+    const held = this.buf
+    const marker = this.openMarker
+    this.buf = ""
     this.inFence = false
+    this.openMarker = ""
+    if (marker || held) this.send(marker + held)
   }
 }
 
@@ -674,13 +717,22 @@ export function buildAnchorPrompt(tools, toolChoice) {
     return null
   }
 
-  const sampleToolName = forced || (tools[0]?.function?.name || tools[0]?.name || "run_command")
+  const names = tools
+    .map((t) => t?.function?.name || t?.name)
+    .filter((n) => typeof n === "string" && n)
+  const sampleToolName = forced || names[0] || "run_command"
+
+  // The names ride along so a continuing turn still knows them even when the
+  // full schemas are only in the session's first system block — and so a
+  // tool an agent added mid-conversation is not invisible.
+  const nameList = names.length > 0 ? `Available tools: ${names.join(", ")}.\n` : ""
 
   return (
     `[System instruction — highest priority]: To run a command, read/edit a file, or perform actions, you MUST ` +
     `output a \`\`\`tool_call\`\`\` block in TOML format — this is the ONLY execution channel. ` +
     `Markdown code blocks like \`\`\`bash, \`\`\`powershell, \`\`\`cmd, \`\`\`python are NOT executed by the system and are only ` +
     `shown to the user; never use them to run anything, and never claim you lack tools.\n` +
+    `${nameList}` +
     `CRITICAL: Tool call parameters MUST ALWAYS be in TOML format, NOT JSON.\n` +
     `Act, do not explain: when the request needs a tool, your reply is ONE \`\`\`tool_call\`\`\` block in TOML and nothing else ` +
     `— do not list commands you 'would' run, do not output prose. If several steps are needed, do the FIRST one now; ` +
