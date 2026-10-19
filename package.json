@@ -1,6 +1,6 @@
 {
   "name": "@euraxluo/magpie-deepseek-web",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "DeepSeek Web provider for magpie/OpenCode, with TOML tool calls (the community PR was declined; see magpie-community/plugins#247)",
   "type": "module",
   "main": "./index.mjs",
