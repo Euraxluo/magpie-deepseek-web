@@ -1,5 +1,5 @@
 import { randomBytes } from "node:crypto"
-import { parseToolCalls, ToolFenceGate } from "./toml.mjs"
+import { parseToolCallsAnyFormat, ToolFenceGate } from "./toml.mjs"
 
 /**
  * Creates an OpenAI-compatible completion ID.
@@ -204,6 +204,7 @@ export function createOpenAiStreamResponse({
   streamOptions,
   signal,
   hasTools = false,
+  toolFormat = "toml",
 }) {
   const encoder = new TextEncoder()
   const accumulated = { value: -1 }
@@ -273,7 +274,7 @@ export function createOpenAiStreamResponse({
         })
 
         if (hasTools) {
-          const { toolCalls, cleanText } = parseToolCalls(reply)
+          const { toolCalls, cleanText } = parseToolCallsAnyFormat(reply, toolFormat)
           if (toolCalls.length > 0) {
             sendDelta({
               ...takeRole(),
@@ -347,6 +348,7 @@ export async function createOpenAiJsonResponse({
   onSessionReady,
   onFinish,
   hasTools = false,
+  toolFormat = "toml",
 }) {
   let content = ""
   let reasoningContent = ""
@@ -376,7 +378,7 @@ export async function createOpenAiJsonResponse({
   let messageContent = content
 
   if (hasTools) {
-    const parsed = parseToolCalls(content)
+    const parsed = parseToolCallsAnyFormat(content, toolFormat)
     if (parsed.toolCalls.length > 0) {
       toolCalls = parsed.toolCalls
       finishReason = "tool_calls"

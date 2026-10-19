@@ -20,6 +20,9 @@ import {
   formatToolCallsToToml,
   formatToolResult,
   parseToolCalls,
+  parseToolCallsAnyFormat,
+  resolveToolFormat,
+  toolPromptsFor,
 } from "./toml.mjs"
 
 const convStore = new ConversationStore({ maxSize: 100, ttlMs: 30 * 60 * 1000 })
@@ -110,8 +113,9 @@ function findLastAssistantIndex(messages) {
   return -1
 }
 
-function buildTurnPrompt({ messages, tools, toolChoice, fresh }) {
+function buildTurnPrompt({ messages, tools, toolChoice, fresh, toolFormat = "toml" }) {
   const hasTools = Array.isArray(tools) && tools.length > 0 && toolChoice !== "none"
+  const prompts = toolPromptsFor(toolFormat, tools, toolChoice)
   const lastAssistantIdx = findLastAssistantIndex(messages)
 
   // OpenAI's tool results name the call only by id; the name lives on the
@@ -158,7 +162,7 @@ function buildTurnPrompt({ messages, tools, toolChoice, fresh }) {
     }
 
     if (hasTools) {
-      const toolsPrompt = buildToolsPrompt(tools, toolChoice)
+      const toolsPrompt = prompts.build(tools, toolChoice)
       if (toolsPrompt) systemParts.push(toolsPrompt)
     }
 
@@ -173,7 +177,7 @@ function buildTurnPrompt({ messages, tools, toolChoice, fresh }) {
         } else if (role === "assistant") {
           if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
             const prefix = extractText(m.content) ? `[Assistant]: ${extractText(m.content)}\n` : "[Assistant]:\n"
-            historyParts.push(prefix + formatToolCallsToToml(m.tool_calls))
+            historyParts.push(prefix + prompts.formatCalls(m.tool_calls))
           } else {
             const t = extractText(m.content)
             if (t) historyParts.push(`[Assistant]: ${t}`)
@@ -202,7 +206,7 @@ function buildTurnPrompt({ messages, tools, toolChoice, fresh }) {
   // bury the tool format, and the last line of the prompt carries the most
   // weight with the web models.
   if (hasTools) {
-    const anchor = buildAnchorPrompt(tools, toolChoice)
+    const anchor = prompts.anchor(tools, toolChoice)
     if (anchor) prompt = prompt ? `${prompt}\n\n${anchor}` : anchor
   }
 
@@ -213,7 +217,7 @@ function buildTurnPrompt({ messages, tools, toolChoice, fresh }) {
  * OpenCode and Magpie provider plugin for DeepSeek's web chat
  * (chat.deepseek.com), with the browser's own userToken as the credential.
  */
-export async function DeepSeekWebPlugin({ client } = {}) {
+export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
   return {
     // Models the provider serves. models.dev does not list this provider, so
     // it is declared here; the npm package names the wire protocol.
@@ -241,7 +245,11 @@ export async function DeepSeekWebPlugin({ client } = {}) {
     auth: {
       provider: PROVIDER_ID,
 
-      async loader(getAuth) {
+      async loader(getAuth, provider) {
+        // The tool-call wire format: "toml" (the default) or "base64". The
+        // plugin's own option wins, then the provider's in OpenCode's config,
+        // then DEEPSEEK_WEB_TOOL_FORMAT.
+        const toolFormat = resolveToolFormat(options?.toolFormat ?? provider?.options?.toolFormat)
         const auth = await getAuth()
         const token = normalizeUserToken(auth?.access ?? auth?.key)
         if (!token) return {}
@@ -346,6 +354,7 @@ export async function DeepSeekWebPlugin({ client } = {}) {
                   tools,
                   toolChoice,
                   fresh,
+                  toolFormat,
                 })
 
                 const previousUsage = conv.hasUsage ? conv.lastUsage : -1
@@ -385,7 +394,9 @@ export async function DeepSeekWebPlugin({ client } = {}) {
                   // survived the gate — so the registered key is built from
                   // exactly that. The raw reply only stands in where a client
                   // streams by re-reading the whole answer.
-                  const shown = toolCalls?.length ? (shownText ?? parseToolCalls(reply).cleanText) : reply
+                  const shown = toolCalls?.length
+                    ? (shownText ?? parseToolCallsAnyFormat(reply, toolFormat).cleanText)
+                    : reply
                   const assistantMsg = { role: "assistant", content: shown }
                   if (toolCalls && toolCalls.length > 0) {
                     assistantMsg.tool_calls = toolCalls
@@ -411,6 +422,7 @@ export async function DeepSeekWebPlugin({ client } = {}) {
                     streamOptions: body.stream_options,
                     signal,
                     hasTools,
+                    toolFormat,
                   })
                 }
                 return createOpenAiJsonResponse({
@@ -422,6 +434,7 @@ export async function DeepSeekWebPlugin({ client } = {}) {
                   onSessionReady,
                   onFinish,
                   hasTools,
+                  toolFormat,
                 })
               } catch (err) {
                 release()

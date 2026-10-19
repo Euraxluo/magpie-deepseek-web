@@ -79,6 +79,32 @@ timeout = 30
 `tool_choice` 按提示词能做的做：`none` 不注入工具，`required` 和指定函数会加
 「必须调用，不要自己回答」，并裁掉其他工具。
 
+## 工具调用（Base64，第二种方案）
+
+TOML 和 Base64 两套方案同时存在，按 provider 选项切换；解析时先试配置的格式，
+再试另一种，所以模型答错格式也还能变成调用。
+
+Base64 方案里，**发出去的输入（工具 schema）仍是 JSON**，要求模型把调用文档
+（`{"name": "...", "arguments": {...}}`）编码成 Base64 放进围栏：
+
+````
+```tool_call_base64
+eyJuYW1lIjoicnVuX2NvbW1hbmQiLCJhcmd1bWVudHMiOnsiY29tbWFuZCI6Im5wbSB0ZXN0In19
+```
+````
+
+切换方式，优先级从高到低：
+
+1. 插件工厂的 `options.toolFormat`（`"toml"` 或 `"base64"`）
+2. OpenCode provider 配置里的 `options.toolFormat`
+3. 环境变量 `DEEPSEEK_WEB_TOOL_FORMAT=base64`（`b64` / `encoded` 也算）
+
+以下都按同一套处理：流式围栏扣留、`finish_reason: "tool_calls"`、历史里的
+工具调用重新编码成 Base64。围栏标签容忍模型常见的变体
+（`tool_call base64`、`tool_call:base64`、`base64_tool_call` 等），URL-safe
+字母表和折行也接受；解出来不是 JSON 的（比如随便一段 Base64 token）不会被
+误认成调用。
+
 ## 限制
 
 - 工具调用是提示词级的，不是协议。模型自己答得上来的问题可能仍会直接回答，

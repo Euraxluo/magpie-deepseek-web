@@ -283,3 +283,140 @@ test("the anchor lists the tool names for a continuing turn", () => {
   )
   assert.match(anchor, /Available tools: run_command, read_file\./)
 })
+
+// --- base64 tool calls -----------------------------------------------------
+
+import {
+  encodeToolCallBase64,
+  parseBase64ToolCalls,
+  parseBase64ToolCall,
+  parseToolCallsAnyFormat,
+  looksBase64,
+  buildBase64ToolsPrompt,
+  buildBase64AnchorPrompt,
+  formatToolCallsToBase64,
+  resolveToolFormat,
+  toolPromptsFor,
+} from "./toml.mjs"
+
+const b64Tools = [
+  {
+    type: "function",
+    function: {
+      name: "run_command",
+      description: "Run a shell command",
+      parameters: { type: "object", properties: { command: { type: "string" } } },
+    },
+  },
+]
+
+test("a base64 tool call round-trips with its arguments unescaped", () => {
+  const args = { command: 'echo "$HOME"\nawk \'{print $1}\' file.txt' }
+  const block = encodeToolCallBase64("run_command", args)
+  assert.match(block, /^```tool_call_base64\n[A-Za-z0-9+/=]+\n```$/)
+
+  const { cleanText, toolCalls } = parseBase64ToolCalls(`On it.\n\n${block}\n\nDone.`)
+  assert.equal(cleanText, "On it.\n\nDone.")
+  assert.equal(toolCalls.length, 1)
+  assert.equal(toolCalls[0].type, "function")
+  assert.equal(toolCalls[0].function.name, "run_command")
+  assert.deepEqual(JSON.parse(toolCalls[0].function.arguments), args)
+  assert.match(toolCalls[0].id, /^call_[0-9a-f]{16}$/)
+})
+
+test("base64 blocks survive the line breaks a model adds", () => {
+  const encoded = Buffer.from(JSON.stringify({ name: "read_file", arguments: { path: "a b.txt" } })).toString("base64")
+  const wrapped = encoded.replace(/(.{16})/g, "$1\n")
+  const { toolCalls } = parseBase64ToolCalls("```tool_call_base64\n" + wrapped + "\n```")
+  assert.equal(toolCalls.length, 1)
+  assert.deepEqual(JSON.parse(toolCalls[0].function.arguments), { path: "a b.txt" })
+})
+
+test("base64 fences in the shapes models improvise are accepted", () => {
+  const body = Buffer.from(JSON.stringify({ tool: "run_command", parameters: { command: "ls" } })).toString("base64")
+  for (const tag of ["tool_call_base64", "tool_call base64", "tool_call:base64", "base64_tool_call", "tool_call"]) {
+    const { toolCalls } = parseBase64ToolCalls("```" + tag + "\n" + body + "\n```")
+    assert.equal(toolCalls.length, 1, `tag ${tag}`)
+    assert.deepEqual(JSON.parse(toolCalls[0].function.arguments), { command: "ls" })
+  }
+})
+
+test("url-safe base64 and a name line before the payload are handled", () => {
+  const json = JSON.stringify({ name: "run_command", arguments: { command: "ls" } })
+  const urlSafe = Buffer.from(json).toString("base64").replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "")
+  assert.equal(parseBase64ToolCall(urlSafe)[0].name, "run_command")
+
+  const inner = Buffer.from(json).toString("base64")
+  const outer = Buffer.from("run_command\n" + inner).toString("base64")
+  const calls = parseBase64ToolCall(outer)
+  assert.equal(calls?.[0]?.name, "run_command")
+})
+
+test("a word, a TOML block or a non-JSON payload is not mistaken for a base64 call", () => {
+  // a bare word passes the alphabet test but decodes to nothing usable
+  assert.equal(looksBase64("tool_name"), false)
+  assert.equal(parseBase64ToolCall("tool_name"), null)
+  // a token that decodes to binary (an auth token, say) is not a call
+  const token = "8XYjvWqHCTEzwIjRAN3kV1Fl673OdliyWs7LxsIrN+VMGTRXvn3ztkhsLqJ48MXr"
+  assert.equal(looksBase64(token), true)
+  assert.equal(parseBase64ToolCall(token), null)
+  const { cleanText, toolCalls } = parseBase64ToolCalls("```tool_call_base64\n" + token + "\n```")
+  assert.equal(toolCalls.length, 0)
+  assert.match(cleanText, /tool_call_base64/, "an unparseable block is left as text, not dropped")
+})
+
+test("the configured format is parsed first and the other is the fallback", () => {
+  const b64 = encodeToolCallBase64("run_command", { command: "ls" })
+  assert.equal(parseToolCallsAnyFormat(b64, "base64").toolCalls[0].function.name, "run_command")
+  assert.equal(parseToolCallsAnyFormat(b64, "base64").format, "base64")
+  // asked for base64, model answered TOML: still a call
+  const toml = '```tool_call\nname = "run_command"\n\n[parameters]\ncommand = "ls"\n```'
+  const fell = parseToolCallsAnyFormat(toml, "base64")
+  assert.equal(fell.toolCalls.length, 1)
+  assert.equal(fell.format, "toml")
+  // asked for TOML, model answered base64
+  assert.equal(parseToolCallsAnyFormat(b64, "toml").toolCalls.length, 1)
+  assert.equal(parseToolCallsAnyFormat("just prose", "toml").toolCalls.length, 0)
+})
+
+test("resolveToolFormat: option, then environment, then TOML", () => {
+  assert.equal(resolveToolFormat("base64"), "base64")
+  assert.equal(resolveToolFormat("B64"), "base64")
+  assert.equal(resolveToolFormat("encoded"), "base64")
+  assert.equal(resolveToolFormat("toml"), "toml")
+  assert.equal(resolveToolFormat(""), "toml")
+  assert.equal(resolveToolFormat(undefined, {}), "toml")
+  assert.equal(resolveToolFormat(undefined, { DEEPSEEK_WEB_TOOL_FORMAT: "base64" }), "base64")
+  assert.equal(resolveToolFormat("toml", { DEEPSEEK_WEB_TOOL_FORMAT: "base64" }), "toml")
+})
+
+test("the base64 prompts show a real encoded example and forbid JSON in the reply", () => {
+  const prompt = buildBase64ToolsPrompt(b64Tools, "auto")
+  assert.match(prompt, /Encode that exact JSON text as base64/)
+  assert.match(prompt, /```tool_call_base64/)
+  assert.match(prompt, /the block holds base64 only/)
+  // the example decodes back to the documented document
+  const example = prompt.match(/```tool_call_base64\n([A-Za-z0-9+/=]+)\n```/)[1]
+  assert.deepEqual(JSON.parse(Buffer.from(example, "base64").toString("utf8")), {
+    name: "run_command",
+    arguments: { command: "npm test" },
+  })
+
+  const anchor = buildBase64AnchorPrompt(b64Tools, "auto")
+  assert.match(anchor, /highest priority/)
+  assert.match(anchor, /Available tools: run_command\./)
+  assert.match(anchor, /base64 ONLY/)
+})
+
+test("history tool calls are re-encoded in the base64 format", () => {
+  const blocks = formatToolCallsToBase64([
+    { id: "call_1", type: "function", function: { name: "run_command", arguments: '{"command":"ls -la"}' } },
+  ])
+  assert.match(blocks, /^```tool_call_base64\n/)
+  assert.deepEqual(parseBase64ToolCall(blocks.split("\n")[1])[0].arguments, { command: "ls -la" })
+})
+
+test("toolPromptsFor picks the pair for the format", () => {
+  assert.equal(toolPromptsFor("base64", b64Tools, "auto").build, buildBase64ToolsPrompt)
+  assert.equal(toolPromptsFor("toml", b64Tools, "auto").build, buildToolsPrompt)
+})

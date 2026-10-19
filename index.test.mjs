@@ -584,3 +584,96 @@ test("the loader turns a tools request into a TOML prompt upstream and tool_call
     globalThis.fetch = realFetch
   }
 })
+
+test("the loader asks for base64 when its option says so, and parses it back", async () => {
+  const calls = []
+  const realFetch = globalThis.fetch
+  const encoded = Buffer.from(
+    JSON.stringify({ name: "run_command", arguments: { command: "ls -la" } }),
+    "utf8"
+  ).toString("base64")
+
+  globalThis.fetch = async (url, init) => {
+    const u = String(url)
+    calls.push({ url: u, init })
+    if (u.endsWith("/api/v0/chat/create_pow_challenge")) {
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          data: {
+            biz_data: {
+              challenge: {
+                algorithm: "DeepSeekHashV1",
+                challenge: "168efa309e5a73033fc82dde4333bbc6515da440ef961574f73f99cbe7b397ad",
+                salt: "a40318e6b7af56bf27cf",
+                expire_at: 1790959021012,
+                signature: "sig",
+                target_path: "/api/v0/chat/completion",
+              },
+            },
+          },
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      )
+    }
+    if (u.endsWith("/api/v0/chat_session/create")) {
+      return new Response(JSON.stringify({ code: 0, data: { biz_data: { chat_session: { id: "sess-b64" } } } }), {
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+    if (u.endsWith("/api/v0/chat/completion")) {
+      const sse = [
+        "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n",
+        `data: ${JSON.stringify({
+          v: {
+            response: {
+              fragments: [{ id: 2, type: "RESPONSE", content: "On it.\n```tool_call_base64\n" + encoded + "\n```" }],
+            },
+          },
+        })}\n\n`,
+        'data: {"p":"response/accumulated_token_usage","v":40}\n\n',
+        "event: close\ndata: {}\n\n",
+      ].join("")
+      return new Response(streamOf(sse), { headers: { "Content-Type": "text/event-stream" } })
+    }
+    return new Response("not found", { status: 404 })
+  }
+
+  try {
+    const { default: plugin } = await import("./index.mjs")
+    const hooks = await plugin({ client: {} }, { toolFormat: "base64" })
+    const loaded = await hooks.auth.loader(async () => ({ type: "api", key: "tok" }))
+
+    const res = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-chat",
+        stream: true,
+        messages: [{ role: "user", content: "list the files" }],
+        tools: [
+          { type: "function", function: { name: "run_command", parameters: { type: "object" } } },
+        ],
+      }),
+    })
+
+    const data = (await res.text())
+      .split("\n\n")
+      .filter((b) => b.startsWith("data: "))
+      .map((b) => b.slice(6))
+    const chunks = data.slice(0, -1).map((d) => JSON.parse(d))
+    const content = chunks.map((c) => c.choices[0]?.delta?.content ?? "").join("")
+    assert.equal(content, "On it.\n", "the base64 fence never reaches the content stream")
+
+    const toolChunk = chunks.find((c) => c.choices[0]?.delta?.tool_calls)
+    assert.equal(toolChunk.choices[0].delta.tool_calls[0].function.name, "run_command")
+    assert.deepEqual(JSON.parse(toolChunk.choices[0].delta.tool_calls[0].function.arguments), { command: "ls -la" })
+    assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls")
+
+    const prompt = JSON.parse(calls.find((c) => c.url.endsWith("/api/v0/chat/completion")).init.body).prompt
+    assert.match(prompt, /Encode that exact JSON text as base64/)
+    assert.match(prompt, /tool_call_base64/)
+    assert.ok(!prompt.includes("parameters in TOML format"), "the TOML format is not asked for in base64 mode")
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
