@@ -109,6 +109,17 @@ function buildTurnPrompt({ messages, tools, toolChoice, fresh }) {
   const hasTools = Array.isArray(tools) && tools.length > 0 && toolChoice !== "none"
   const lastAssistantIdx = findLastAssistantIndex(messages)
 
+  // OpenAI's tool results name the call only by id; the name lives on the
+  // assistant turn that asked for it. The model needs the name: it is what
+  // tells it which step just finished.
+  const callNames = new Map()
+  for (const m of messages) {
+    for (const tc of Array.isArray(m?.tool_calls) ? m.tool_calls : []) {
+      if (tc?.id && tc?.function?.name) callNames.set(tc.id, tc.function.name)
+    }
+  }
+  const resultLabel = (msg) => msg.name || callNames.get(msg.tool_call_id) || msg.tool_call_id
+
   const newMessages =
     lastAssistantIdx >= 0
       ? messages.slice(lastAssistantIdx + 1)
@@ -121,7 +132,7 @@ function buildTurnPrompt({ messages, tools, toolChoice, fresh }) {
     const role = msg?.role
     if (role === "tool") {
       const text = extractText(msg.content)
-      turnParts.push(formatToolResult(msg.name || msg.tool_call_id, text))
+      turnParts.push(formatToolResult(resultLabel(msg), text))
     } else if (role === "user") {
       const text = extractText(msg.content)
       if (text) turnParts.push(text)
@@ -163,7 +174,7 @@ function buildTurnPrompt({ messages, tools, toolChoice, fresh }) {
             if (t) historyParts.push(`[Assistant]: ${t}`)
           }
         } else if (role === "tool") {
-          historyParts.push(formatToolResult(m.name || m.tool_call_id, extractText(m.content)))
+          historyParts.push(formatToolResult(resultLabel(m), extractText(m.content)))
         }
       }
     }
