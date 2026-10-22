@@ -1,4 +1,9 @@
 import { randomBytes } from "node:crypto"
+import { scanToolReply, ToolOutputGate } from "./tool-protocol.mjs"
+
+export class ToolFenceGate extends ToolOutputGate {
+  constructor(emit) { super(emit, { parseLegacy: parseToml }) }
+}
 
 /**
  * Parses a TOML string into a JavaScript object.
@@ -551,102 +556,6 @@ function normalizeSingleToolCall(item) {
   }
 }
 
-const OPEN_MARKERS = ["```tool_call", "```toml_tool_call", "```tool_call_base64", "```base64_tool_call"]
-const CLOSE_MARKER = "```"
-
-/**
- * Gate that buffers streaming text deltas to prevent raw tool call fences
- * from leaking into the user-visible content stream.
- *
- * Text outside fences goes out as it arrives; everything from an opening
- * fence to its closing one is held back, and so is a tail that could still
- * turn out to be the start of a fence. `sent` is what the client actually
- * received, which is always a prefix of the full reply.
- *
- * Every format's opening marker is held, whichever one the request asked for:
- * a model that ignores the instruction still must not leak its fence.
- */
-export class ToolFenceGate {
-  constructor(emit, markers = OPEN_MARKERS) {
-    this.emit = emit
-    this.markers = markers
-    this.buf = ""
-    this.inFence = false
-    this.openMarker = ""
-    this.sent = ""
-  }
-
-  send(str) {
-    if (!str) return
-    this.sent += str
-    this.emit(str)
-  }
-
-  push(delta) {
-    this.buf += delta
-    while (true) {
-      if (this.inFence) {
-        const j = this.buf.indexOf(CLOSE_MARKER)
-        if (j < 0) return // In fence, hold back until closing fence arrives
-        this.buf = this.buf.slice(j + CLOSE_MARKER.length)
-        this.inFence = false
-        this.openMarker = ""
-        continue
-      }
-      const open = earliestMarker(this.buf, this.markers)
-      if (open) {
-        this.send(this.buf.slice(0, open.index))
-        this.buf = this.buf.slice(open.index + open.marker.length)
-        this.inFence = true
-        this.openMarker = open.marker
-        continue
-      }
-      const keep = Math.max(...this.markers.map((m) => partialPrefixLen(this.buf, m)))
-      if (keep > 0) {
-        this.send(this.buf.slice(0, this.buf.length - keep))
-        this.buf = this.buf.slice(this.buf.length - keep)
-        return
-      }
-      this.send(this.buf)
-      this.buf = ""
-      return
-    }
-  }
-
-  /**
-   * Releases whatever is still buffered. A fence the model never closed is
-   * sent with its opening marker, since there is nothing to parse and
-   * dropping it would lose the only answer there is.
-   */
-  flush() {
-    const held = this.buf
-    const marker = this.openMarker
-    this.buf = ""
-    this.inFence = false
-    this.openMarker = ""
-    if (marker || held) this.send(marker + held)
-  }
-}
-
-function earliestMarker(s, markers) {
-  let found = null
-  for (const marker of markers) {
-    const index = s.indexOf(marker)
-    if (index >= 0 && (!found || index < found.index)) found = { index, marker }
-  }
-  return found
-}
-
-function partialPrefixLen(s, marker) {
-  const max = Math.min(marker.length - 1, s.length)
-  for (let k = max; k > 0; k--) {
-    if (marker.startsWith(s.slice(s.length - k))) {
-      return k
-    }
-  }
-  return 0
-}
-
 /**
  * Formats OpenAI tool_calls into TOML ```tool_call blocks for feeding back into model context.
  */
@@ -829,39 +738,28 @@ export function buildAnchorPrompt(tools, toolChoice) {
 }
 
 // ---------------------------------------------------------------------------
-// Base64 tool calls
+// Plaintext JSON tool calls
 //
-// The second format the plugin can ask for. Where the TOML one reads well in a
-// transcript, this one is short and has nothing a web model can break: a base64
-// alphabet has no braces, quotes, newlines or escapes, so a long shell command
-// or a file body passes through without any escaping at all. The model encodes
-// a JSON document; the prompt shows it an encoded example, so what it copies is
-// the alphabet rather than the JSON shape.
+// The format asked for now. The model writes one JSON document per call inside
+// a ```tool_call fence — nothing encoded, so a reading of the transcript shows
+// exactly what ran. A fence is read as JSON first; TOML inside the same fence
+// and `{"type":"tool_use", ...}` (Claude Code) are accepted too, since models
+// fall back to them. Only this fence is executable: bare prose, a bash block
+// or a sentence describing a call is not.
 // ---------------------------------------------------------------------------
 
 /**
- * The fence a base64 tool call arrives in. `tool_call_base64` is what the
- * instructions ask for; the rest are what models emit when they improvise.
+ * Every spelling of the execution fence. `tool_call` is what the instructions
+ * ask for; the rest are what models emit when they improvise.
  */
-export const BASE64_TOOL_CALL_RE =
-  /```(?:tool_call(?:_tool_call)?[:\s_-]*(?:base64|b64)|base64_tool_call|tool_call)\s*\n?([A-Za-z0-9+/=_\-\s]+?)```/g
+export const TOOL_CALL_FENCE_RE =
+  /```(?:tool_call|tool-call|tool_calls|json_tool_call)\s*\n?([\s\S]*?)```/gi
+
+/** A `<tool_call>…</tool_call>` wrapper, which some models prefer to fences. */
+const XML_TOOL_CALL_RE = /<tool_call>\s*([\s\S]*?)\s*<\/tool_call>/gi
 
 /**
- * Whether a fenced block is base64 rather than TOML/JSON. A TOML call starts
- * with `name =` and a JSON one with `{`, so a block made only of the base64
- * alphabet is not either of them.
- */
-export function looksBase64(block) {
-  const compact = String(block || "").replace(/\s+/g, "")
-  if (compact.length < 8) return false
-  if (!/^[A-Za-z0-9+/=_-]+$/.test(compact)) return false
-  // a plain word (`tool_name`) passes the alphabet test; real base64 of a JSON
-  // document is longer and decodes to something that starts with `{`
-  return compact.length >= 16 || /[A-Z0-9+/=]/.test(compact)
-}
-
-/**
- * Parses Claude Code / Anthropic style XML tool use inside decoded content:
+ * Parses Claude Code / Anthropic style XML tool use:
  * <tool_use><name>...</name><input>...</input></tool_use> or
  * <invoke name="..."><parameter name="...">...</parameter></invoke>.
  */
@@ -907,75 +805,31 @@ export function parseXmlToolCalls(text) {
 }
 
 /**
- * Decodes a base64 block into a tool call. Returns null when the text is not
- * base64, does not decode to UTF-8, or decodes to something with no tool call
- * in it — so a caller can tell "not this format" from "this format, bad call".
- */
-export function parseBase64ToolCall(block) {
-  const compact = String(block || "").replace(/\s+/g, "")
-  if (!compact) return null
-
-  let text
-  try {
-    // url-safe alphabets appear when a model re-encodes carelessly
-    const normalized = compact.replace(/-/g, "+").replace(/_/g, "/")
-    text = Buffer.from(normalized, "base64").toString("utf8")
-  } catch {
-    return null
-  }
-  if (!text || text.includes("�")) return null // not UTF-8: not our payload
-
-  let parsed
-  try {
-    parsed = JSON.parse(text)
-  } catch {
-    // If the base64 payload decodes to Claude Code XML tool use
-    const xmlCalls = parseXmlToolCalls(text)
-    if (xmlCalls.length > 0) {
-      const norm = normalizeJsonToolCalls(xmlCalls)
-      if (norm.length > 0) return norm
-    }
-
-    // Some models add the name on a line before the encoded JSON; take the
-    // longest base64-looking run and try that alone.
-    const runs = text.match(/[A-Za-z0-9+/=_-]{16,}/g) || []
-    for (const run of runs) {
-      try {
-        const inner = JSON.parse(Buffer.from(run.replace(/-/g, "+").replace(/_/g, "/"), "base64").toString("utf8"))
-        const calls = normalizeJsonToolCalls(inner)
-        if (calls.length > 0) return calls
-      } catch {}
-    }
-    return null
-  }
-
-  const calls = normalizeJsonToolCalls(parsed)
-  return calls.length > 0 ? calls : null
-}
-
-/**
- * Normalizes the JSON document a model encoded into tool calls:
+ * Normalizes the JSON document a model wrote into tool calls:
  * `{name, arguments}` / `{tool, parameters}` / `{tool_calls: [...]}`.
  */
 export function normalizeJsonToolCalls(parsed) {
   return normalizeTomlToolCalls(parsed)
 }
 
-/**
- * Encodes a tool call as the model is asked to return it: the JSON document,
- * base64-encoded, in a `tool_call_base64` fence.
- */
-export function encodeToolCallBase64(name, args) {
-  const doc = { name, arguments: args ?? {} }
-  const encoded = Buffer.from(JSON.stringify(doc), "utf8").toString("base64")
-  return "```tool_call_base64\n" + encoded + "\n```"
+/** The document a tool call is written as. */
+export function encodeToolCallJson(name, args) {
+  return JSON.stringify({ name, arguments: args ?? {} })
 }
 
 /**
- * Formats OpenAI tool_calls as the encoded blocks a fresh session's history
- * shows, so the model's own past calls look like what it is asked to produce.
+ * Formats a tool call as the model is asked to return it: the JSON document
+ * alone, in a `tool_call` fence.
  */
-export function formatToolCallsToBase64(toolCalls) {
+export function formatToolCallJson(name, args) {
+  return "```tool_call\n" + encodeToolCallJson(name, args) + "\n```"
+}
+
+/**
+ * Formats OpenAI tool_calls as the blocks a fresh session's history shows, so
+ * the model's own past calls look like what it is asked to produce.
+ */
+export function formatToolCallsToJson(toolCalls) {
   if (!Array.isArray(toolCalls) || toolCalls.length === 0) return ""
   return toolCalls
     .map((tc) => {
@@ -990,28 +844,77 @@ export function formatToolCallsToBase64(toolCalls) {
       } else if (fn.arguments && typeof fn.arguments === "object") {
         args = fn.arguments
       }
-      return encodeToolCallBase64(fn.name || "tool", args)
+      return formatToolCallJson(fn.name || "tool", args)
     })
     .join("\n\n")
 }
 
 /**
- * Extracts tool calls from base64-fenced blocks. Returns { cleanText, toolCalls }.
+ * Parses the body of one fence into tool calls. JSON is the format asked for;
+ * TOML and XML are what a model falls back to, and are read rather than lost.
+ * Returns null when the block holds no recognizable call.
  */
-export function parseBase64ToolCalls(text) {
+export function parseToolCallBlock(block) {
+  const body = String(block || "").trim()
+  if (!body) return null
+
+  // An XML call is itself the document; reading it as JSON would only pick up
+  // a nested <input> object, which has no name and would be thrown away.
+  if (/<(?:tool_use|invoke)\b/i.test(body)) {
+    const xmlCalls = parseXmlToolCalls(body)
+    if (xmlCalls.length > 0) {
+      const norm = normalizeJsonToolCalls(xmlCalls)
+      if (norm.length > 0) return norm
+    }
+  }
+
+  let parsed
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    // A model may wrap its document in prose.
+    const inner = body.match(/\{[\s\S]*\}/)
+    if (inner) {
+      try {
+        parsed = JSON.parse(inner[0])
+      } catch {}
+    }
+    if (parsed === undefined) {
+      const xmlCalls = parseXmlToolCalls(body)
+      if (xmlCalls.length > 0) {
+        const norm = normalizeJsonToolCalls(xmlCalls)
+        if (norm.length > 0) return norm
+      }
+      try {
+        parsed = parseToml(body)
+      } catch {
+        return null
+      }
+    }
+  }
+
+  const calls = normalizeJsonToolCalls(parsed)
+  return calls.length > 0 ? calls : null
+}
+
+/**
+ * Extracts tool calls from the execution fences. Returns { cleanText, toolCalls }.
+ */
+export function parseJsonToolCalls(text) {
   if (!text || typeof text !== "string") {
     return { cleanText: "", toolCalls: [] }
   }
 
   const toolCalls = []
-  const matches = [...text.matchAll(BASE64_TOOL_CALL_RE)]
+  const seen = new Set()
 
-  for (const match of matches) {
-    const block = match[1]
-    if (!looksBase64(block)) continue
-    const calls = parseBase64ToolCall(block)
-    if (!calls) continue
+  const take = (calls) => {
     for (const call of calls) {
+      // A model that repeats the same document in a fence and again in a
+      // <tool_call> wrapper means one call, not two.
+      const key = `${call.name}\x1f${JSON.stringify(call.arguments ?? {})}`
+      if (seen.has(key)) continue
+      seen.add(key)
       toolCalls.push({
         id: call.id || `call_${randomBytes(8).toString("hex")}`,
         type: "function",
@@ -1023,18 +926,32 @@ export function parseBase64ToolCalls(text) {
     }
   }
 
-  const cleanText = toolCalls.length > 0
-    ? text.replace(BASE64_TOOL_CALL_RE, "").replace(/\n{3,}/g, "\n\n").trim()
-    : text.trim()
+  // Only a block that really holds a call is consumed. One that holds prose
+  // stays as text: the model's writing is not the system's to discard.
+  const cleanText = text
+    .replace(TOOL_CALL_FENCE_RE, (whole, body) => {
+      const calls = parseToolCallBlock(body)
+      if (!calls) return whole
+      take(calls)
+      return ""
+    })
+    .replace(XML_TOOL_CALL_RE, (whole, body) => {
+      const calls = parseToolCallBlock(body)
+      if (!calls) return whole
+      take(calls)
+      return ""
+    })
+    .replace(/\n{3,}/g, "\n\n")
+    .trim()
+
   return { cleanText, toolCalls }
 }
 
 /**
- * The system instructions for the base64 format: the schemas, the encoding
- * rule, and one worked example whose encoded text is generated here rather
- * than made up, so the model copies a real alphabet.
+ * The system instructions for the plaintext format: the schemas, the exact
+ * shape, and one worked example of a call.
  */
-export function buildBase64ToolsPrompt(tools, toolChoice) {
+export function buildJsonToolsPrompt(tools, toolChoice) {
   const { mode, forced } = parseToolChoice(toolChoice)
   if (!Array.isArray(tools) || tools.length === 0 || mode === "none") {
     return null
@@ -1051,99 +968,89 @@ export function buildBase64ToolsPrompt(tools, toolChoice) {
 
   let rule = "Only produce a tool_call block when a tool is needed."
   if (forced) {
-    rule = `You MUST call the tool "${forced}". Reply with the encoded block and nothing else — do not answer the question yourself.`
+    rule = `You MUST call the tool "${forced}". Reply with the tool_call block and nothing else — do not answer the question yourself.`
   } else if (mode === "required") {
-    rule = "You MUST call one of the tools above. Reply with the encoded block and nothing else — do not answer the question yourself."
+    rule = "You MUST call one of the tools above. Reply with the tool_call block and nothing else — do not answer the question yourself."
   }
 
-  const sample = encodeToolCallBase64(defs[0].name, { command: "npm test" })
-  const sampleDoc = JSON.stringify({ name: defs[0].name, arguments: { command: "npm test" } })
+  const sampleName = forced || defs[0].name
+  const sample = formatToolCallJson(sampleName, { command: "npm test" })
 
   return (
     `[System instruction]: You have access to the following tools:\n` +
     `\`\`\`json\n${JSON.stringify(defs, null, 2)}\n\`\`\`\n\n` +
-    `To call a tool, do NOT write JSON or TOML in your reply. Encode the call as base64 and send only the encoding:\n` +
-    `1. Build the tool call in standard Codex or Claude Code JSON format:\n` +
-    `   Codex: {"name": "<tool name>", "arguments": {<the tool's arguments>}}\n` +
-    `   Claude Code: {"type": "tool_use", "name": "<tool name>", "input": {<the tool's arguments>}}\n` +
-    `2. Encode that exact JSON text as base64 (UTF-8).\n` +
-    `3. Reply with one fenced block, the tag \`tool_call_base64\` and the encoded text alone:\n\n` +
+    `To call a tool, reply with one fenced block tagged \`tool_call\` holding a single JSON object ` +
+    `with exactly two keys: "name" and "arguments".\n` +
+    `Format:\n` +
     `${sample}\n\n` +
-    `That example decodes to:\n` +
-    `${sampleDoc}\n\n` +
-    `Rules: the block holds base64 only — no JSON, no prose, no line breaks needed. ` +
-    `A tool with no arguments encodes {"name": "<tool name>", "arguments": {}}. ` +
-    `CRITICAL: Argument values must be raw values. DO NOT wrap values in XML tags like <parameter> or </parameter>. ` +
-    `DO NOT add extra quotes inside string arguments. ` +
-    `One tool call per reply unless several are needed; then use one block each.\n` +
+    `Rules:\n` +
+    `- The block holds JSON only — no prose, no comments, no TOML.\n` +
+    `- "arguments" is an object with the tool's own parameters; a tool with none uses {}.\n` +
+    `- Argument values are raw JSON values. Do NOT wrap values in XML tags like <parameter> or </parameter>.\n` +
+    `- One tool call per block. For several calls, use one block each.\n` +
     `${rule}`
   )
 }
 
 /**
- * The end-of-prompt anchor for the base64 format. Same reasoning as the TOML
- * one: a long agent prompt buries a format stated only at the top.
+ * The end-of-prompt anchor for the plaintext format. Same reasoning as the
+ * TOML one: a long agent prompt buries a format stated only at the top.
  */
-export function buildBase64AnchorPrompt(tools, toolChoice) {
+export function buildJsonAnchorPrompt(tools, toolChoice, parallelToolCalls = true) {
   const { mode, forced } = parseToolChoice(toolChoice)
   if (!Array.isArray(tools) || tools.length === 0 || mode === "none") {
     return null
   }
 
-  const names = tools.map((t) => t?.function?.name || t?.name).filter((n) => typeof n === "string" && n)
+  const definitions = tools.map((tool) => {
+    const fn = tool?.function || tool || {}
+    return { name: fn.name || "", description: fn.description || "", parameters: fn.parameters || {} }
+  }).filter((tool) => tool.name && (!forced || tool.name === forced))
+  const names = definitions.map((tool) => tool.name)
   const sampleName = forced || names[0] || "run_command"
-  const sample = encodeToolCallBase64(sampleName, { command: "npm test" })
-  const nameList = names.length > 0 ? `Available tools: ${names.join(", ")}.\n` : ""
+  const sample = formatToolCallJson(sampleName, { command: "npm test" })
+  const nameList = names.length > 0 ? `Available tools and current argument schemas:\n${JSON.stringify(definitions)}\n` : ""
+  const batchRule = parallelToolCalls === false
+    ? "Emit exactly one tool call in this response; parallel calls are disabled.\n"
+    : "Emit independent tool calls as separate blocks in the same response; use one call when the next step depends on a result.\n"
 
   return (
     `[System instruction — highest priority]: To run a command, read/edit a file, or perform actions, you MUST ` +
-    `call a tool by replying with a \`\`\`tool_call_base64\`\`\` block holding base64-encoded JSON — this is the ONLY ` +
-    `execution channel. Markdown code blocks like \`\`\`bash, \`\`\`powershell, \`\`\`cmd, \`\`\`python are NOT executed by ` +
-    `the system and are only shown to the user; never use them to run anything, and never claim you lack tools.\n` +
+    `call a tool by replying with a \`\`\`tool_call\`\`\` block holding {"name": "<tool>", "arguments": {…}} as ` +
+    `JSON — this is the ONLY execution channel. Markdown code blocks like \`\`\`bash, \`\`\`powershell, \`\`\`cmd, ` +
+    `\`\`\`python are NOT executed by the system and are only shown to the user; never use them to run anything, ` +
+    `and never claim you lack tools.\n` +
     `${nameList}` +
-    `CRITICAL: the block must contain base64 ONLY. Do not put JSON, TOML or prose in it.\n` +
-    `CRITICAL: All parameter values must be raw values. DO NOT include XML tags (NO <parameter>, NO </parameter>).\n` +
-    `Act, do not explain: when the request needs a tool, your reply is ONE \`\`\`tool_call_base64\`\`\` block and nothing ` +
-    `else — do not list commands you 'would' run, do not output prose. If several steps are needed, do the FIRST one ` +
-    `now; you will be called again with its result to continue.\n` +
+    `CRITICAL: the block must be plain JSON with "name" and "arguments". Do not put prose in it.\n` +
+    `CRITICAL: All parameter values must be raw JSON values. DO NOT include XML tags (NO <parameter>, NO </parameter>).\n` +
+    `Act, do not explain: when the request needs tools, emit one \`\`\`tool_call\`\`\` block per call. ` +
+    `${batchRule}` +
+    `Continue from the latest tool result. Do not repeat a successful call or claim a step succeeded unless its result confirms it. ` +
+    `When a call depends on an earlier result, emit only the next required call. Do not list commands you 'would' run ` +
+    `or add prose.\n` +
     `Know when to STOP: once a tool result shows a step succeeded (for example exit code 0), that step is DONE — do ` +
     `not run it again and do not retry the same thing. When the whole request is accomplished, stop calling tools and ` +
     `reply with a short final answer.\n` +
     `Example — user asks "run the check", you reply with exactly one block:\n` +
     `${sample}\n` +
-    `(It decodes to {"name": "${sampleName}", "arguments": {"command": "npm test"}}. Use a real tool name from the ` +
-    `list above and its own arguments.) When the request needs a tool, emit the encoded block now.`
+    `(It holds {"name": "${sampleName}", "arguments": {"command": "npm test"}}. Use a real tool name from the ` +
+    `list above and its own arguments.) When the request needs a tool, emit the block now.`
   )
 }
 
-/**
- * Picks the tool-call wire format: "toml" or "base64". The plugin option wins,
- * then the environment, then TOML.
- */
-export function resolveToolFormat(optionValue, env = typeof process !== "undefined" ? process.env : {}) {
-  const raw = String(optionValue ?? env?.DEEPSEEK_WEB_TOOL_FORMAT ?? "").trim().toLowerCase()
-  if (raw === "toml") return "toml"
-  if (raw === "base64" || raw === "b64" || raw === "encoded") return "base64"
-  return "base64"
+/** The tool-call wire format is fixed to plaintext JSON. */
+export function resolveToolFormat() {
+  return "json"
 }
 
-/**
- * Parses a reply in the configured format, falling back to the other one:
- * whichever a model actually emitted is more useful than nothing.
- */
-export function parseToolCallsAnyFormat(text, format = "toml") {
-  const first = format === "base64" ? parseBase64ToolCalls(text) : parseToolCalls(text)
-  if (first.toolCalls.length > 0) return { ...first, format }
-  const second = format === "base64" ? parseToolCalls(text) : parseBase64ToolCalls(text)
-  if (second.toolCalls.length > 0) return { ...second, format: format === "base64" ? "toml" : "base64" }
-  return { cleanText: text, toolCalls: [], format }
+export function parseToolCallsAnyFormat(text) {
+  const parsed = scanToolReply(text, { parseLegacy: parseToml })
+  return { ...parsed, cleanText: parsed.cleanText.replace(/\n{3,}/g, "\n\n").trim(), format: "json" }
 }
 
 /**
  * The prompts for a format, as one call site uses them.
  */
-export function toolPromptsFor(format, tools, toolChoice) {
-  return format === "base64"
-    ? { build: buildBase64ToolsPrompt, anchor: buildBase64AnchorPrompt, formatCalls: formatToolCallsToBase64 }
-    : { build: buildToolsPrompt, anchor: buildAnchorPrompt, formatCalls: formatToolCallsToToml }
+export function toolPromptsFor(_format, tools, toolChoice) {
+  return { build: buildJsonToolsPrompt, anchor: buildJsonAnchorPrompt, formatCalls: formatToolCallsToJson }
 }

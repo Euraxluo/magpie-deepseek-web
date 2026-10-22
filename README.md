@@ -28,89 +28,48 @@ magpie plugin login deepseek-web
 
 ## 模型
 
-| 模型 | 深度思考 | 联网搜索 |
-|---|---|---|
-| `deepseek-web/deepseek-chat` | | |
-| `deepseek-web/deepseek-reasoner` | ✓ | |
-| `deepseek-web/deepseek-search` | | ✓ |
-| `deepseek-web/deepseek-reasoner-search` | ✓ | ✓ |
+只提供单一模型 `deepseek-web/deepseek-web`。插件将 DeepSeek Web 的 `model_type` 固定为 `null`，由网页会话选择当前模型，不把 provider 模型名映射成网页端模型 ID。
 
-## 工具调用（TOML）
+## 工具调用（明文 JSON）
 
-网页端没有协议层的 function calling，只有文本。插件把工具定义写进系统提示，
-让模型用 **TOML** 输出工具调用，再解析回标准 OpenAI `tool_calls`。
-
-**参数一律用 TOML，不用 JSON**：
-
-- 命令、文件内容、diff 这类多行参数放进 `'''…'''` 字面量多行字符串，原样传输。
-  JSON 要把每个换行写成 `\n`、每个引号转义，长参数里模型经常写错，一个坏转义
-  整次调用就丢了。
-- 没有花括号/方括号配平问题，截断或字段顺序变化都还能解析。
-- 同样的 schema 下 token 更少，围栏也更好读。
-
-要求的格式：
+网页端没有协议层的 function calling，只有文本。插件把工具 schema 写入系统提示，
+要求模型把每次调用写成 `tool_call` 围栏里的一个 JSON 文档：
 
 ````
 ```tool_call
-name = "run_command"
-
-[parameters]
-command = '''
-npm test
-'''
-timeout = 30
+{"name": "run_command", "arguments": {"command": "npm test"}}
 ```
 ````
 
-插件做的事：
+`arguments` 直接是工具自己的参数对象，命令、文件内容和 diff 原样放在里面。
+Codex 的 `{name, arguments}`、Claude Code 的 `{type:"tool_use", name, input}`
+以及 `{tool_calls: [...]}` 数组都能识别；同一轮写多个围栏即为并行调用。
+兼容上游偶发的 DSML（单/双竖线、全角/ASCII、带空格的 calls/tool_calls 标签）；
+字符串参数保留原始空白、引号和换行，不做可能改变文件内容的清洗。Base64 调用不再执行。
 
-- **首轮**：工具 schema 和格式说明写进 `[System]` 块；提示词末尾再加一条最高
-  优先级的锚点。agent 的系统提示动辄几十 KB（Codex 约 40 KB），会把格式说明
-  冲没，模型于是答「我没有工具」。
-- **后续轮**：这一轮只发工具结果，末尾再补一次锚点；历史留在上游会话里。
-- **流式**：`tool_call` 围栏内的内容先扣住，闭合后解析成 `tool_calls` 分片，
-  `finish_reason: "tool_calls"`；围栏外的正文照常实时下发，围栏原文不会漏进
-  `delta.content`。
-- **非流式**：`message.tool_calls`，`content` 里去掉围栏，
-  `finish_reason: "tool_calls"`。
-- **下一轮**：把 assistant 的 `tool_calls` 和其后的 `tool` 消息折回成 TOML 块
-  和一行干净的结果，模型看到的就是它被要求输出的格式。
+有工具的响应会缓冲到本轮结束，再统一解析和校验整批调用。校验工具名称、参数对象、
+必填字段、类型、schema 明确禁止的额外字段及 tool_choice/parallel_tool_calls。
+通过后转换为标准 OpenAI `tool_calls`（并行调用按 `index: 0,1,…` 发出）。
+无效、截断、未知工具的调用不会原样泄漏或以正常 stop 结束；任何工具执行前最多请求上游纠正一次，
+再次失败则返回 `invalid_tool_call` 并回滚会话父节点，避免无限重试和部分批次被执行。
+代价是工具回合的正文要等上游整轮结束才显示；推理内容仍按原有方式流式传输。
 
-`tool_choice` 按提示词能做的做：`none` 不注入工具，`required` 和指定函数会加
-「必须调用，不要自己回答」，并裁掉其他工具。
+历史工具调用按 JSON 格式重建。明确的旧 TOML 围栏仍兼容；裸 JSON、普通 bash 代码块
+以及描述性文字不会作为工具调用执行。
 
-## 工具调用（Base64，第二种方案）
-
-TOML 和 Base64 两套方案同时存在，按 provider 选项切换；解析时先试配置的格式，
-再试另一种，所以模型答错格式也还能变成调用。
-
-Base64 方案里，**发出去的输入（工具 schema）仍是 JSON**，要求模型把调用文档
-（`{"name": "...", "arguments": {...}}`）编码成 Base64 放进围栏：
-
-````
-```tool_call_base64
-eyJuYW1lIjoicnVuX2NvbW1hbmQiLCJhcmd1bWVudHMiOnsiY29tbWFuZCI6Im5wbSB0ZXN0In19
-```
-````
-
-切换方式，优先级从高到低：
-
-1. 插件工厂的 `options.toolFormat`（`"toml"` 或 `"base64"`）
-2. OpenCode provider 配置里的 `options.toolFormat`
-3. 环境变量 `DEEPSEEK_WEB_TOOL_FORMAT=base64`（`b64` / `encoded` 也算）
-
-以下都按同一套处理：流式围栏扣留、`finish_reason: "tool_calls"`、历史里的
-工具调用重新编码成 Base64。围栏标签容忍模型常见的变体
-（`tool_call base64`、`tool_call:base64`、`base64_tool_call` 等），URL-safe
-字母表和折行也接受；解出来不是 JSON 的（比如随便一段 Base64 token）不会被
-误认成调用。
+`tool_choice` 通过提示词处理：`none` 不注入工具，`required` 和指定函数会要求调用，并裁掉其他工具。
+旧配置中的 `toolFormat` 和 `DEEPSEEK_WEB_TOOL_FORMAT` 不再切换协议，始终使用明文 JSON。
 
 ## 限制
 
-- 工具调用是提示词级的，不是协议。模型自己答得上来的问题可能仍会直接回答，
-  `required` 也只能"要求"而不能真正强制。
+- 上游工具调用依赖文本生成，不能承诺模型永远生成正确调用；`required` 未满足时会纠正一次，
+  仍未满足则明确报错。参数校验覆盖常用结构约束，不等同于完整 JSON Schema 规范验证器。
 - 每轮只发最后一条 assistant 之后的消息，更早的上下文留在上游会话里。
-- 网页端对超长提示词是**从尾部静默截断**，所以每轮只发增量就是为了别撞这个墙。
+  这里算的是**最后一条有内容的 assistant**（有正文或有工具调用）：客户端重放空 stop 时会追加一条
+  空 assistant，若以它为界，重试请求就只剩工具锚点、没有任务和工具结果，模型会从零重新开始。
+- 上游这一轮没有正文也没有工具调用（只有推理，或空 stop），或续接本身失败时：先在同一个网页会话里从上一个节点重试一次；还不行就丢掉这个会话，在 DeepSeek 网页上新开一个 chat session，把当前请求的完整历史发过去，之后的轮次接着这个新会话，直到它再失败。登录失效、限流和客户端取消不会新开会话。为了在空 stop 到达客户端之前换会话，这一轮的推理和正文会等上游结束再一起发出。
+- 网页端的“消息发送过于频繁”是流里的 `event: hint`（`finish_reason: rate_limit_reached`），HTTP 仍是 200 且没有正文。这种回合按 429 返回给客户端，不当作空回合重试：立刻重试只会把限流拖得更久。
+- 网页端对超长提示词是**从尾部静默截断**，所以每轮只发增量就是为了别撞这个墙。换新会话那一次例外：完整历史要重发一遍，之后的轮次仍只发增量。
 
 ## 测试
 

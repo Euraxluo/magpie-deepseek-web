@@ -91,21 +91,13 @@ test("decodeJwtClaims reads a payload, null for anything else", () => {
   assert.equal(decodeJwtClaims("not-a-jwt"), null)
 })
 
-test("resolveModel maps names, aliases and unknown deepseek ids to a served model", () => {
-  assert.equal(resolveModel("deepseek-chat").id, "deepseek-chat")
-  assert.equal(resolveModel("deepseek-v3").id, "deepseek-chat")
-  assert.equal(resolveModel("deepseek-r1").id, "deepseek-reasoner")
-  assert.equal(resolveModel("deepseek-reasoner").thinking, true)
-  assert.equal(resolveModel("deepseek-search").search, true)
-  assert.equal(resolveModel("deepseek-reasoner-search").thinking, true)
-  assert.equal(resolveModel("deepseek-reasoner-search").search, true)
-  // a future or renamed id keeps working, as deepseek2api's heuristics do
-  assert.equal(resolveModel("deepseek-v4.1-flash").id, "deepseek-chat")
-  assert.equal(resolveModel("deepseek-v9-reasoner").id, "deepseek-reasoner")
-  assert.equal(resolveModel("deepseek-v9-search-think").id, "deepseek-reasoner-search")
-  // anything else is chat, as the proxy's default was
-  assert.equal(resolveModel("gpt-4o").id, "deepseek-chat")
-  assert.equal(resolveModel(undefined).id, "deepseek-chat")
+test("resolveModel exposes one web-session model regardless of the outer name", () => {
+  for (const name of ["deepseek-web", "deepseek-chat", "deepseek-v3", "deepseek-r1", "gpt-4o", undefined]) {
+    const model = resolveModel(name)
+    assert.equal(model.id, "deepseek-web")
+    assert.equal(model.thinking, false)
+    assert.equal(model.search, false)
+  }
 })
 
 test("content fingerprints and prefix keys separate models and images", () => {
@@ -354,11 +346,13 @@ test("no token means no loader config", async () => {
   assert.deepEqual(await hooks.auth.loader(async () => ({ type: "api", key: "" })), {})
 })
 
-test("a TOML tool call in a streamed reply becomes tool_calls, and the fence never reaches content", async () => {
+test("a JSON tool call in a streamed reply becomes tool_calls, and the fence never reaches content", async () => {
+  const doc = JSON.stringify({ name: "run_command", arguments: { command: "ls -la" } })
+  const firstDelta = `Let me check.\n\n\`\`\`tool_call\n${doc.slice(0, 18)}`
   const text = sseText([
     "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n",
-    'data: {"v":{"response":{"fragments":[{"id":2,"type":"RESPONSE","content":"Let me check.\\n\\n```tool_"}]}}}\n\n',
-    'data: {"v":"call\\nname = \\"run_command\\"\\n\\n[parameters]\\ncommand = \\"ls -la\\"\\n```"}\n\n',
+    "data: " + JSON.stringify({ v: { response: { fragments: [{ id: 2, type: "RESPONSE", content: firstDelta }] } } }) + "\n\n",
+    "data: " + JSON.stringify({ v: `${doc.slice(18)}\n\`\`\`` }) + "\n\n",
     'data: {"p":"response/accumulated_token_usage","v":60}\n\n',
     "event: close\ndata: {}\n\n",
   ])
@@ -391,10 +385,92 @@ test("a TOML tool call in a streamed reply becomes tool_calls, and the fence nev
   assert.equal(finished.calls.length, 1)
 })
 
-test("a non-streaming TOML tool call becomes message.tool_calls with finish_reason tool_calls", async () => {
+test("multiple streamed JSON fences emit tool_calls indices 0 and 1", async () => {
+  const first = JSON.stringify({ name: "run_command", arguments: { command: "pwd" } })
+  const second = JSON.stringify({ name: "read_file", arguments: { path: "a.txt" } })
+  const block = ["```tool_call", first, "```", "", "```tool_call", second, "```"].join("\n")
+  const text = sseText([
+    'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+    "data: " + JSON.stringify({ v: { response: { fragments: [{ id: 2, type: "RESPONSE", content: block }] } } }) + "\n\n",
+    'data: {"p":"response/accumulated_token_usage","v":30}\n\n',
+    "event: close\ndata: {}\n\n",
+  ])
+
+  const res = await createOpenAiStreamResponse({
+    upstreamStream: streamOf(text),
+    completionId: "chatcmpl-t-fences",
+    modelName: "deepseek-chat",
+    createdAt: 1700000000,
+    hasTools: true,
+  })
+  const data = await readAll(res)
+  const chunks = data.slice(0, -1).map((d) => JSON.parse(d))
+  const toolChunk = chunks.find((chunk) => chunk.choices[0]?.delta?.tool_calls)
+  assert.deepEqual(toolChunk.choices[0].delta.tool_calls.map((call) => call.index), [0, 1])
+  assert.deepEqual(toolChunk.choices[0].delta.tool_calls.map((call) => call.function.name), ["run_command", "read_file"])
+  assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls")
+})
+
+test("a TOML call inside the fence is read, not printed", async () => {
+  const block = ["Before", '```tool_call\nname = "run_command"\n[parameters]\ncommand = "pwd"\n```', "After"].join("\n")
+  const text = sseText([
+    'event: ready\ndata: {"request_message_id":1,"response_message_id":2}\n\n',
+    "data: " + JSON.stringify({ v: { response: { fragments: [{ id: 2, type: "RESPONSE", content: block }] } } }) + "\n\n",
+    "event: close\ndata: {}\n\n",
+  ])
+
+  const res = await createOpenAiStreamResponse({
+    upstreamStream: streamOf(text),
+    completionId: "chatcmpl-t-legacy",
+    modelName: "deepseek-chat",
+    createdAt: 1700000000,
+    hasTools: true,
+  })
+  const data = await readAll(res)
+  const chunks = data.slice(0, -1).map((d) => JSON.parse(d))
+  const content = chunks.map((chunk) => chunk.choices[0]?.delta?.content ?? "").join("")
+  assert.equal(content, "Before\n\nAfter")
+  const toolChunk = chunks.find((chunk) => chunk.choices[0]?.delta?.tool_calls)
+  assert.equal(toolChunk.choices[0].delta.tool_calls[0].function.name, "run_command")
+  assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls")
+})
+
+test("a streamed JSON tool_calls array emits indices 0 and 1", async () => {
+  const document = JSON.stringify({
+    tool_calls: [
+      { id: "call_0", type: "function", function: { name: "run_command", arguments: { command: "pwd" } } },
+      { id: "call_1", type: "function", function: { name: "read_file", arguments: { path: "a.txt" } } },
+    ],
+  })
+  const block = `\`\`\`tool_call\n${document}\n\`\`\``
   const text = sseText([
     "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n",
-    'data: {"v":{"response":{"fragments":[{"id":2,"type":"RESPONSE","content":"```tool_call\\nname = \\"read_file\\"\\n\\n[parameters]\\npath = \\"a.txt\\"\\n```"}]}}}\n\n',
+    "data: " + JSON.stringify({ v: { response: { fragments: [{ id: 2, type: "RESPONSE", content: block }] } } }) + "\n\n",
+    'data: {"p":"response/accumulated_token_usage","v":30}\n\n',
+    "event: close\ndata: {}\n\n",
+  ])
+
+  const res = await createOpenAiStreamResponse({
+    upstreamStream: streamOf(text),
+    completionId: "chatcmpl-t-array",
+    modelName: "deepseek-chat",
+    createdAt: 1700000000,
+    hasTools: true,
+  })
+  const data = await readAll(res)
+  const chunks = data.slice(0, -1).map((d) => JSON.parse(d))
+  const toolChunk = chunks.find((chunk) => chunk.choices[0]?.delta?.tool_calls)
+  assert.deepEqual(toolChunk.choices[0].delta.tool_calls.map((call) => call.index), [0, 1])
+  assert.deepEqual(toolChunk.choices[0].delta.tool_calls.map((call) => call.function.name), ["run_command", "read_file"])
+  assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls")
+})
+
+test("a non-streaming JSON tool call becomes message.tool_calls with finish_reason tool_calls", async () => {
+  const document = JSON.stringify({ name: "read_file", arguments: { path: "a.txt" } })
+  const block = `\`\`\`tool_call\n${document}\n\`\`\``
+  const text = sseText([
+    "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n",
+    "data: " + JSON.stringify({ v: { response: { fragments: [{ id: 2, type: "RESPONSE", content: block }] } } }) + "\n\n",
     'data: {"p":"response/accumulated_token_usage","v":30}\n\n',
     "event: close\ndata: {}\n\n",
   ])
@@ -413,7 +489,7 @@ test("a non-streaming TOML tool call becomes message.tool_calls with finish_reas
   assert.deepEqual(JSON.parse(json.choices[0].message.tool_calls[0].function.arguments), { path: "a.txt" })
 })
 
-test("a prompt for a fresh session carries tool instructions and the anchor in TOML", async () => {
+test("a prompt for a fresh session carries JSON tool instructions and anchor", async () => {
   const { _internal } = await import("./index.mjs")
   const tools = [
     {
@@ -436,9 +512,9 @@ test("a prompt for a fresh session carries tool instructions and the anchor in T
   })
   assert.equal(images.length, 0)
   assert.match(prompt, /You are a coding agent\./)
-  assert.match(prompt, /parameter[s]? in TOML format/)
+  assert.match(prompt, /```tool_call\n/)
   assert.match(prompt, /System instruction — highest priority/)
-  assert.match(prompt, /name = "run_command"/)
+  assert.match(prompt, /the ONLY execution channel/)
   assert.match(prompt, /list the files/)
   // the anchor is last, where a web model weights it most
   assert.ok(prompt.indexOf("highest priority") > prompt.indexOf("list the files"))
@@ -467,7 +543,50 @@ test("after a tool call, the next turn sends the tool result and the tools ancho
   assert.match(prompt, /highest priority/)
 })
 
-test("a fresh session rebuilds prior tool calls as TOML blocks", async () => {
+test("an empty stop replayed as history does not drop the pending tool result", async () => {
+  const { _internal } = await import("./index.mjs")
+  const tools = [{ type: "function", function: { name: "run_command", parameters: {} } }]
+  // A client retries an empty stop by appending an assistant turn with no text
+  // and no calls. That turn must not become the split point, or the retry sends
+  // the anchor alone and the model restarts from nothing.
+  const messages = [
+    { role: "system", content: "You are a coding agent." },
+    { role: "user", content: "list the files" },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [
+        { id: "call_1", type: "function", function: { name: "run_command", arguments: '{"command":"ls"}' } },
+      ],
+    },
+    { role: "tool", tool_call_id: "call_1", name: "run_command", content: "a.txt" },
+    { role: "assistant", content: "" },
+  ]
+
+  const { prompt } = _internal.buildTurnPrompt({ messages, tools, toolChoice: "auto", fresh: false })
+  assert.match(prompt, /Tool result for run_command/)
+  assert.match(prompt, /a\.txt/, "the retry still carries what the tool said")
+})
+
+test("a whitespace-only assistant turn is not a split point either", async () => {
+  const { _internal } = await import("./index.mjs")
+  const tools = [{ type: "function", function: { name: "run_command", parameters: {} } }]
+  const messages = [
+    { role: "system", content: "agent" },
+    { role: "user", content: "list the files" },
+    {
+      role: "assistant",
+      content: null,
+      tool_calls: [{ id: "c", type: "function", function: { name: "run_command", arguments: "{}" } }],
+    },
+    { role: "tool", tool_call_id: "c", name: "run_command", content: "a.txt" },
+    { role: "assistant", content: "\n\n  " },
+  ]
+  const { prompt } = _internal.buildTurnPrompt({ messages, tools, toolChoice: "auto", fresh: false })
+  assert.match(prompt, /a\.txt/)
+})
+
+test("a fresh session rebuilds prior tool calls as JSON blocks", async () => {
   const { _internal } = await import("./index.mjs")
   const tools = [{ type: "function", function: { name: "run_command", parameters: {} } }]
   const messages = [
@@ -484,8 +603,7 @@ test("a fresh session rebuilds prior tool calls as TOML blocks", async () => {
     { role: "user", content: "now read a.txt" },
   ]
   const { prompt } = _internal.buildTurnPrompt({ messages, tools, toolChoice: "auto", fresh: true })
-  assert.match(prompt, /```tool_call\nname = "run_command"/)
-  assert.match(prompt, /command = "ls"/)
+  assert.match(prompt, /```tool_call\n\{"name":"run_command","arguments":\{"command":"ls"\}\}\n```/)
   assert.match(prompt, /Tool result for run_command/)
   assert.match(prompt, /now read a\.txt/)
 })
@@ -500,7 +618,58 @@ test("prefix keys ignore id and shape differences in tool calls", () => {
   assert.equal(calculatePrefixKey(a, "m"), calculatePrefixKey(b, "m"))
 })
 
-test("the loader turns a tools request into a TOML prompt upstream and tool_calls back", async () => {
+test("a parallel tool round continues the same upstream session", async () => {
+  const { _internal } = await import("./index.mjs")
+  _internal.convStore.clear?.()
+
+  const tools = [{ type: "function", function: { name: "read" } }]
+  const firstTurn = [
+    { role: "system", content: "agent" },
+    { role: "user", content: "read both" },
+  ]
+
+  // What the plugin registers after its first turn: the call it showed the
+  // client, with empty prose.
+  const shownCalls = [
+    { index: 0, id: "call_a", type: "function", function: { name: "read", arguments: '{"path":"a"}' } },
+    { index: 1, id: "call_b", type: "function", function: { name: "read", arguments: '{"path":"b"}' } },
+  ]
+
+  // What the client sends back: the same calls in its own shape, plus one
+  // tool result per call — two new messages, not one.
+  const nextTurn = [
+    ...firstTurn,
+    {
+      role: "assistant",
+      content: "\n\n",
+      tool_calls: [
+        { id: "call_a", type: "function", function: { name: "read", arguments: { path: "a" } } },
+        { id: "call_b", type: "function", function: { name: "read", arguments: { path: "b" } } },
+      ],
+    },
+    { role: "tool", tool_call_id: "call_a", name: "read", content: "A" },
+    { role: "tool", tool_call_id: "call_b", name: "read", content: "B" },
+  ]
+
+  const key = calculatePrefixKey([...firstTurn, { role: "assistant", content: "", tool_calls: shownCalls }], "deepseek-chat")
+  const conv = { sessionId: "sess-parallel", token: "tok", lastUsed: Date.now() }
+  _internal.convStore.register(key, conv)
+
+  let created = 0
+  const client = { createSession: async () => (created++, { id: "new" }) }
+  const found = await _internal.conversationFor({
+    messages: nextTurn,
+    modelId: "deepseek-chat",
+    client,
+    token: "tok",
+  })
+  assert.equal(found.fresh, false, "the parallel round continues the session the first turn opened")
+  assert.equal(found.conv.sessionId, "sess-parallel")
+  assert.equal(created, 0)
+  _internal.convStore.clear?.()
+})
+
+test("the loader turns a tools request into a JSON prompt upstream and tool_calls back", async () => {
   const calls = []
   const realFetch = globalThis.fetch
   globalThis.fetch = async (url, init) => {
@@ -533,9 +702,10 @@ test("the loader turns a tools request into a TOML prompt upstream and tool_call
       })
     }
     if (u.endsWith("/api/v0/chat/completion")) {
+      const block = `\`\`\`tool_call\n${JSON.stringify({ name: "run_command", arguments: { command: "ls -la" } })}\n\`\`\``
       const sse = [
         "event: ready\ndata: {\"request_message_id\":1,\"response_message_id\":2}\n\n",
-        'data: {"v":{"response":{"fragments":[{"id":2,"type":"RESPONSE","content":"```tool_call\\nname = \\"run_command\\"\\n\\n[parameters]\\ncommand = \\"ls -la\\"\\n```"}]}}}\n\n',
+        "data: " + JSON.stringify({ v: { response: { fragments: [{ id: 2, type: "RESPONSE", content: block }] } } }) + "\n\n",
         'data: {"p":"response/accumulated_token_usage","v":40}\n\n',
         "event: close\ndata: {}\n\n",
       ].join("")
@@ -576,7 +746,11 @@ test("the loader turns a tools request into a TOML prompt upstream and tool_call
 
     const upstream = calls.find((c) => c.url.endsWith("/api/v0/chat/completion"))
     const body = JSON.parse(upstream.init.body)
-    assert.match(body.prompt, /parameters in TOML format/)
+    assert.equal(body.model_type, null)
+    assert.equal(body.thinking_enabled, false)
+    assert.equal(body.search_enabled, false)
+    assert.match(body.prompt, /```tool_call\n/)
+    assert.doesNotMatch(body.prompt, /CRITICAL INSTRUCTION: Tool calls MUST be formatted/)
     assert.match(body.prompt, /highest priority/)
     assert.match(body.prompt, /run_command/)
     assert.equal(body.session_id, undefined)
@@ -585,13 +759,10 @@ test("the loader turns a tools request into a TOML prompt upstream and tool_call
   }
 })
 
-test("the loader asks for base64 when its option says so, and parses it back", async () => {
+test("the loader always asks for JSON and parses it back", async () => {
   const calls = []
   const realFetch = globalThis.fetch
-  const encoded = Buffer.from(
-    JSON.stringify({ name: "run_command", arguments: { command: "ls -la" } }),
-    "utf8"
-  ).toString("base64")
+  const document = JSON.stringify({ name: "run_command", arguments: { command: "ls -la" } })
 
   globalThis.fetch = async (url, init) => {
     const u = String(url)
@@ -617,7 +788,7 @@ test("the loader asks for base64 when its option says so, and parses it back", a
       )
     }
     if (u.endsWith("/api/v0/chat_session/create")) {
-      return new Response(JSON.stringify({ code: 0, data: { biz_data: { chat_session: { id: "sess-b64" } } } }), {
+      return new Response(JSON.stringify({ code: 0, data: { biz_data: { chat_session: { id: "sess-json" } } } }), {
         headers: { "Content-Type": "application/json" },
       })
     }
@@ -627,7 +798,7 @@ test("the loader asks for base64 when its option says so, and parses it back", a
         `data: ${JSON.stringify({
           v: {
             response: {
-              fragments: [{ id: 2, type: "RESPONSE", content: "On it.\n```tool_call_base64\n" + encoded + "\n```" }],
+              fragments: [{ id: 2, type: "RESPONSE", content: "On it.\n```tool_call\n" + document + "\n```" }],
             },
           },
         })}\n\n`,
@@ -641,7 +812,7 @@ test("the loader asks for base64 when its option says so, and parses it back", a
 
   try {
     const { default: plugin } = await import("./index.mjs")
-    const hooks = await plugin({ client: {} }, { toolFormat: "base64" })
+    const hooks = await plugin({ client: {} }, { toolFormat: "json" })
     const loaded = await hooks.auth.loader(async () => ({ type: "api", key: "tok" }))
 
     const res = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
@@ -662,7 +833,7 @@ test("the loader asks for base64 when its option says so, and parses it back", a
       .map((b) => b.slice(6))
     const chunks = data.slice(0, -1).map((d) => JSON.parse(d))
     const content = chunks.map((c) => c.choices[0]?.delta?.content ?? "").join("")
-    assert.equal(content, "On it.\n", "the base64 fence never reaches the content stream")
+    assert.equal(content, "On it.\n", "the tool fence never reaches the content stream")
 
     const toolChunk = chunks.find((c) => c.choices[0]?.delta?.tool_calls)
     assert.equal(toolChunk.choices[0].delta.tool_calls[0].function.name, "run_command")
@@ -670,9 +841,272 @@ test("the loader asks for base64 when its option says so, and parses it back", a
     assert.equal(chunks.at(-1).choices[0].finish_reason, "tool_calls")
 
     const prompt = JSON.parse(calls.find((c) => c.url.endsWith("/api/v0/chat/completion")).init.body).prompt
-    assert.match(prompt, /Encode that exact JSON text as base64/)
-    assert.match(prompt, /tool_call_base64/)
-    assert.ok(!prompt.includes("parameters in TOML format"), "the TOML format is not asked for in base64 mode")
+    assert.match(prompt, /```tool_call\n/)
+    assert.ok(!prompt.includes("Base64"), "no encoded format is asked for")
+    assert.ok(!prompt.includes("parameters in TOML format"), "the TOML format is not asked for")
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+function powFetch(completions) {
+  let n = 0
+  const calls = []
+  const fetch = async (url, init) => {
+    const u = String(url)
+    calls.push({ url: u, init })
+    if (u.endsWith("/api/v0/chat/create_pow_challenge")) {
+      return new Response(
+        JSON.stringify({
+          code: 0,
+          data: {
+            biz_data: {
+              challenge: {
+                algorithm: "DeepSeekHashV1",
+                challenge: "168efa309e5a73033fc82dde4333bbc6515da440ef961574f73f99cbe7b397ad",
+                salt: "a40318e6b7af56bf27cf",
+                expire_at: 1790959021012,
+                signature: "sig",
+                target_path: "/api/v0/chat/completion",
+              },
+            },
+          },
+        }),
+        { headers: { "Content-Type": "application/json" } }
+      )
+    }
+    if (u.endsWith("/api/v0/chat_session/create")) {
+      n += 1
+      return new Response(
+        JSON.stringify({ code: 0, data: { biz_data: { chat_session: { id: `sess-${n}` } } } }),
+        { headers: { "Content-Type": "application/json" } }
+      )
+    }
+    if (u.endsWith("/api/v0/chat_session/delete")) {
+      return new Response(JSON.stringify({ code: 0, data: { biz_data: {} } }), {
+        headers: { "Content-Type": "application/json" },
+      })
+    }
+    if (u.endsWith("/api/v0/chat/completion")) {
+      const body = JSON.parse(init.body)
+      const next = completions.shift()
+      if (!next) throw new Error(`unexpected completion on ${body.chat_session_id}`)
+      if (next.throw) throw next.throw
+      const reply = typeof next === "function" ? next(body) : next
+      const fragments = []
+      if (reply.think) fragments.push({ id: 1, type: "THINK", content: reply.think })
+      if (reply.text) fragments.push({ id: 2, type: "RESPONSE", content: reply.text })
+      const frames = [
+        `event: ready\ndata: ${JSON.stringify({ request_message_id: 1, response_message_id: reply.id })}
+\n`,
+      ]
+      if (reply.hint) {
+        frames.push(
+          `event: hint\ndata: ${JSON.stringify({ type: "error", content: reply.hint, finish_reason: "rate_limit_reached" })}\n\n`
+        )
+      }
+      if (fragments.length > 0) {
+        frames.push(`data: ${JSON.stringify({ v: { response: { fragments } } })}\n\n`)
+      }
+      frames.push('data: {"p":"response/accumulated_token_usage","v":40}\n\n')
+      frames.push("event: close\ndata: {}\n\n")
+      return new Response(streamOf(frames.join("")), { headers: { "Content-Type": "text/event-stream" } })
+    }
+    return new Response("not found", { status: 404 })
+  }
+  return { calls, fetch, push: (reply) => completions.push(reply) }
+}
+
+function completionBodies(calls) {
+  return calls
+    .filter((c) => c.url.endsWith("/api/v0/chat/completion"))
+    .map((c) => JSON.parse(c.init.body))
+}
+
+async function loadedPlugin() {
+  const { default: plugin, _internal } = await import("./index.mjs")
+  _internal.convStore.clear()
+  const hooks = await plugin({ client: {} })
+  const loaded = await hooks.auth.loader(async () => ({ type: "api", key: "tok" }))
+  return { loaded, _internal }
+}
+
+const sayTool = [{ type: "function", function: { name: "read_file", parameters: { type: "object" } } }]
+
+test("an empty stop is retried once on the same DeepSeek session before the client sees it", async () => {
+  const script = powFetch([
+    { id: 11, think: "thinking only" },
+    { id: 12, text: "the files are a.txt" },
+  ])
+  const realFetch = globalThis.fetch
+  globalThis.fetch = script.fetch
+  try {
+    const { loaded } = await loadedPlugin()
+    const res = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-web",
+        stream: false,
+        messages: [{ role: "user", content: "list the files" }],
+      }),
+    })
+    const json = await res.json()
+    assert.equal(json.choices[0].message.content, "the files are a.txt")
+    const sent = completionBodies(script.calls)
+    assert.equal(sent.length, 2)
+    assert.equal(sent[0].chat_session_id, sent[1].chat_session_id)
+    assert.equal(sent[1].parent_message_id, null, "the retry branches from the previous node, not the empty one")
+    assert.equal(script.calls.filter((c) => c.url.endsWith("/api/v0/chat_session/create")).length, 1)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test("a session that stays empty opens a new DeepSeek chat and resends the history", async () => {
+  const history = [
+    { role: "system", content: "You edit LittleSprout." },
+    { role: "user", content: "read WorldView" },
+    {
+      role: "assistant",
+      content: "",
+      tool_calls: [{ id: "call_1", type: "function", function: { name: "read_file", arguments: '{"path":"WorldView.tsx"}' } }],
+    },
+    { role: "tool", tool_call_id: "call_1", name: "read_file", content: "export default function WorldView() {}" },
+  ]
+  const script = powFetch([
+    { id: 21, text: "```tool_call\n" + JSON.stringify({ name: "read_file", arguments: { path: "WorldView.tsx" } }) + "\n```" },
+    { id: 31, think: "nothing" },
+    { id: 32, think: "still nothing" },
+    (body) => {
+      assert.match(body.prompt, /You edit LittleSprout/)
+      assert.match(body.prompt, /export default function WorldView/)
+      assert.equal(body.parent_message_id, null)
+      return { id: 41, text: "WorldView now uses the species emoji." }
+    },
+  ])
+  const realFetch = globalThis.fetch
+  globalThis.fetch = script.fetch
+  try {
+    const { loaded } = await loadedPlugin()
+    const first = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-web",
+        stream: false,
+        messages: history.slice(0, 2),
+        tools: sayTool,
+      }),
+    })
+    assert.equal((await first.json()).choices[0].finish_reason, "tool_calls")
+
+    const second = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({ model: "deepseek-web", stream: true, messages: history, tools: sayTool }),
+    })
+    const chunks = (await second.text())
+      .split("\n\n")
+      .filter((b) => b.startsWith("data: ") && !b.includes("[DONE]"))
+      .map((b) => JSON.parse(b.slice(6)))
+    const content = chunks.map((c) => c.choices[0]?.delta?.content ?? "").join("")
+    assert.equal(content, "WorldView now uses the species emoji.")
+
+    const sent = completionBodies(script.calls)
+    assert.equal(sent[1].chat_session_id, sent[0].chat_session_id)
+    assert.equal(sent[2].chat_session_id, sent[0].chat_session_id)
+    assert.notEqual(sent[3].chat_session_id, sent[0].chat_session_id)
+    assert.ok(!sent[1].prompt.includes("You edit LittleSprout"), "the same session only gets the new turn")
+    assert.equal(script.calls.filter((c) => c.url.endsWith("/api/v0/chat_session/delete")).length, 1)
+
+    // The next request of the same chat continues the session that answered.
+    script.push({ id: 51, text: "done" })
+    const third = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-web",
+        stream: false,
+        messages: [...history, { role: "assistant", content: "WorldView now uses the species emoji." }, { role: "user", content: "stop" }],
+      }),
+    })
+    assert.equal((await third.json()).choices[0].message.content, "done")
+    const continued = completionBodies(script.calls).at(-1)
+    assert.equal(continued.chat_session_id, sent[3].chat_session_id)
+    assert.equal(continued.parent_message_id, 41)
+    assert.ok(!continued.prompt.includes("You edit LittleSprout"), "history stays on the new session")
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test("a rate limit is not retried by opening another DeepSeek session", async () => {
+  const { DeepSeekError } = await import("./client.mjs")
+  const script = powFetch([{ throw: new DeepSeekError("limited", 429) }])
+  const realFetch = globalThis.fetch
+  globalThis.fetch = script.fetch
+  try {
+    const { loaded } = await loadedPlugin()
+    const res = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-web",
+        stream: false,
+        messages: [{ role: "user", content: "list the files" }],
+      }),
+    })
+    assert.equal(res.status, 429)
+    assert.equal(completionBodies(script.calls).length, 1)
+    assert.equal(script.calls.filter((c) => c.url.endsWith("/api/v0/chat_session/create")).length, 1)
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test("a hinted rate limit is reported, not mistaken for an empty turn", async () => {
+  // DeepSeek throttles with HTTP 200, then an in-band hint and no reply. Read
+  // as an empty turn, it was retried on the same session and then on a new
+  // chat, three more requests into a throttle that was still active.
+  const script = powFetch([{ id: 61, hint: "消息发送过于频繁，请稍后重试" }])
+  const realFetch = globalThis.fetch
+  globalThis.fetch = script.fetch
+  try {
+    const { loaded } = await loadedPlugin()
+    const res = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-web",
+        stream: false,
+        messages: [{ role: "user", content: "list the files" }],
+      }),
+    })
+    assert.equal(res.status, 429)
+    assert.match((await res.json()).error.message, /rate limited/)
+    assert.equal(completionBodies(script.calls).length, 1, "a throttle is not retried")
+    assert.equal(
+      script.calls.filter((c) => c.url.endsWith("/api/v0/chat_session/create")).length,
+      1,
+      "no second chat is opened for it"
+    )
+  } finally {
+    globalThis.fetch = realFetch
+  }
+})
+
+test("a hint beside a real reply is a notice, not a throttle", async () => {
+  const script = powFetch([{ id: 62, text: "a.txt", hint: "slow down" }])
+  const realFetch = globalThis.fetch
+  globalThis.fetch = script.fetch
+  try {
+    const { loaded } = await loadedPlugin()
+    const res = await loaded.fetch("https://chat.deepseek.com/v1/chat/completions", {
+      method: "POST",
+      body: JSON.stringify({
+        model: "deepseek-web",
+        stream: false,
+        messages: [{ role: "user", content: "list the files" }],
+      }),
+    })
+    assert.equal(res.status, 200)
+    assert.equal((await res.json()).choices[0].message.content, "a.txt")
+    assert.equal(completionBodies(script.calls).length, 1)
   } finally {
     globalThis.fetch = realFetch
   }

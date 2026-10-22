@@ -1,7 +1,7 @@
 {
   "name": "@euraxluo/magpie-deepseek-web",
-  "version": "0.3.2",
-  "description": "DeepSeek Web provider for magpie/OpenCode, with TOML or base64 tool calls (the community PR was declined; see magpie-community/plugins#247)",
+  "version": "0.5.0",
+  "description": "DeepSeek Web provider for magpie/OpenCode, using the current web-session model and plaintext JSON tool calls",
   "type": "module",
   "main": "./index.mjs",
   "exports": "./index.mjs",
@@ -14,6 +14,7 @@
     "conv.mjs",
     "models.mjs",
     "toml.mjs",
+    "tool-protocol.mjs",
     "README.md",
     "LICENSE"
   ],

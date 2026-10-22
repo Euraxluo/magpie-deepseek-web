@@ -13,6 +13,7 @@ import {
   createOpenAiJsonResponse,
   createOpenAiStreamResponse,
   newCompletionId,
+  readDeepSeekSseStream,
 } from "./sse.mjs"
 import {
   buildAnchorPrompt,
@@ -83,9 +84,10 @@ async function readJsonBody(input, init) {
  * Picks or opens the DeepSeek session a request continues.
  *
  * `body.conversation_id`, if given, names an upstream session outright. Else
- * the key is every message but the last: a client that appends one exchange
- * per request then hits the session the previous turn registered under the
- * messages as they stood after that turn.
+ * the key is the client's history up to its last assistant turn — that is the
+ * list the previous request registered after its turn. It is not "every
+ * message but the last": a parallel tool round appends one tool result per
+ * call, so slicing off only the last one can never match.
  */
 async function conversationFor({ messages, modelId, conversationId, client, token, signal }) {
   const usable = (conv) => conv && conv.token === token
@@ -94,9 +96,12 @@ async function conversationFor({ messages, modelId, conversationId, client, toke
     const bySession = convStore.getBySession(conversationId)
     if (usable(bySession)) return { conv: bySession, fresh: false }
   } else {
-    const key = calculatePrefixKey(messages.slice(0, -1), modelId)
-    const byPrefix = convStore.getByPrefix(key)
-    if (usable(byPrefix)) return { conv: byPrefix, fresh: false }
+    const lastAssistantIdx = findLastAssistantIndex(messages)
+    const endings = lastAssistantIdx >= 0 ? [lastAssistantIdx + 1, messages.length - 1] : [messages.length - 1]
+    for (const end of endings) {
+      const byPrefix = convStore.getByPrefix(calculatePrefixKey(messages.slice(0, end), modelId))
+      if (usable(byPrefix)) return { conv: byPrefix, fresh: false }
+    }
   }
 
   const sessionId = await client.createSession(signal)
@@ -113,10 +118,30 @@ function findLastAssistantIndex(messages) {
   return -1
 }
 
-function buildTurnPrompt({ messages, tools, toolChoice, fresh, toolFormat = "toml" }) {
+/**
+ * The last assistant turn that actually said something — prose or a tool call.
+ *
+ * A client replays an empty stop as an appended assistant turn holding no text
+ * and no calls. Splitting the turn at that message would leave nothing between
+ * it and the end of the history, so the retry would carry the tools anchor
+ * alone: no task, no tool results. The model then restarts from nothing and
+ * answers with reasoning only, which is the empty-stop spiral. Anchoring on the
+ * last substantive turn keeps the pending tool results in the retry.
+ */
+function findLastMeaningfulAssistantIndex(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i]
+    if (m?.role !== "assistant") continue
+    const hasCalls = Array.isArray(m.tool_calls) && m.tool_calls.length > 0
+    if (hasCalls || extractText(m.content).trim()) return i
+  }
+  return -1
+}
+
+function buildTurnPrompt({ messages, tools, toolChoice, parallelToolCalls, fresh, toolFormat = "json" }) {
   const hasTools = Array.isArray(tools) && tools.length > 0 && toolChoice !== "none"
   const prompts = toolPromptsFor(toolFormat, tools, toolChoice)
-  const lastAssistantIdx = findLastAssistantIndex(messages)
+  const lastAssistantIdx = findLastMeaningfulAssistantIndex(messages)
 
   // OpenAI's tool results name the call only by id; the name lives on the
   // assistant turn that asked for it. The model needs the name: it is what
@@ -206,11 +231,210 @@ function buildTurnPrompt({ messages, tools, toolChoice, fresh, toolFormat = "tom
   // bury the tool format, and the last line of the prompt carries the most
   // weight with the web models.
   if (hasTools) {
-    const anchor = prompts.anchor(tools, toolChoice)
+    const anchor = prompts.anchor(tools, toolChoice, parallelToolCalls)
     if (anchor) prompt = prompt ? `${prompt}\n\n${anchor}` : anchor
   }
 
   return { prompt, images: turnImages }
+}
+
+/**
+ * Reads one upstream completion into memory.
+ *
+ * A turn that comes back empty must be retried before the client sees a stop,
+ * so nothing is forwarded live. Reasoning and prose are replayed together once
+ * the turn is accepted.
+ */
+async function readUpstreamTurn(stream) {
+  let reply = ""
+  let reasoning = ""
+  let usage = -1
+  let responseId = null
+  let hint = null
+  await readDeepSeekSseStream(stream, {
+    onReady: (_requestId, id) => {
+      responseId = id
+    },
+    onDelta: (type, text) => {
+      if (type === "THINK") reasoning += text
+      else reply += text
+    },
+    onUsage: (tokens) => {
+      usage = tokens
+    },
+    onHint: (h) => {
+      hint = h
+    },
+  })
+  return { reply, reasoning, usage, responseId, hint }
+}
+
+/** True when the model produced prose. A tool fence lives in that prose. */
+function turnHasReply(turn) {
+  return Boolean(turn?.reply && turn.reply.trim())
+}
+
+/**
+ * The 429 a hint frame stands for, or null when the turn carries none.
+ *
+ * DeepSeek throttles a fast sender in-band: the completion answers 200, then
+ * closes with `event: hint` and "retry later" instead of a reply. Only a turn
+ * with nothing else in it is a throttle; a hint beside real prose is just a
+ * notice and must not throw the reply away.
+ */
+function rateLimitFromHint(turn) {
+  if (turn?.hint?.finishReason !== "rate_limit_reached" || turn.reply?.trim()) return null
+  return new DeepSeekError(`deepseek rate limited this account: ${turn.hint.content}`, 429)
+}
+
+/**
+ * Whether a failed turn may be retried on this session or on a new one.
+ * An empty turn passes `null`: there is no error, the session itself went quiet.
+ * Auth failures, rate limits and a cancelled request must not open sessions.
+ */
+function canReplaceSession(err, signal) {
+  if (signal?.aborted) return false
+  if (!err) return true
+  if (err.name === "AbortError") return false
+  if (err.status === 401 || err.status === 403 || err.status === 429) return false
+  if (err.code === 40002 || err.code === 40003) return false
+  return true
+}
+
+/** Rebuilds a collected turn as the SSE shape the OpenAI adapters already read. */
+function replayUpstream(turn) {
+  const fragments = []
+  if (turn.reasoning) fragments.push({ id: 1, type: "THINK", content: turn.reasoning })
+  if (turn.reply) fragments.push({ id: 2, type: "RESPONSE", content: turn.reply })
+  const frames = [
+    `event: ready\ndata: ${JSON.stringify({ request_message_id: 1, response_message_id: turn.responseId })}\n\n`,
+  ]
+  if (fragments.length > 0) {
+    frames.push(`data: ${JSON.stringify({ v: { response: { fragments } } })}\n\n`)
+  }
+  if (turn.usage >= 0) {
+    frames.push(`data: ${JSON.stringify({ p: "response/accumulated_token_usage", v: turn.usage })}\n\n`)
+  }
+  frames.push("event: close\ndata: {}\n\n")
+  const encoded = new TextEncoder().encode(frames.join(""))
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoded)
+      controller.close()
+    },
+  })
+}
+
+/**
+ * QuotaHub's Gemini web rule, on a DeepSeek web chat.
+ *
+ * A bad turn is retried once against the same session, branching from the
+ * previous node. If that is still bad, the session is dropped and a new
+ * DeepSeek chat is opened with the full history. The caller keeps whichever
+ * conversation actually answered, so the next turn continues that chat until
+ * it fails the same way.
+ */
+async function resolveSessionTurn({
+  conv,
+  prompt,
+  freshPrompt,
+  client,
+  token,
+  signal,
+  completionInput,
+}) {
+  const attempt = async (target, promptText) => {
+    const parentMessageId = target.hasParent ? target.parentMessageId : null
+    const upstream = await client.completion(
+      {
+        ...completionInput,
+        sessionId: target.sessionId,
+        parentMessageId,
+        prompt: promptText,
+      },
+      signal
+    )
+    const turn = await readUpstreamTurn(upstream.body)
+    // A throttled turn is not an empty one: DeepSeek closed the stream with a
+    // hint and no reply. Retrying it at once, on this session or a new chat,
+    // is what keeps the throttle going, so it is reported instead.
+    const throttled = rateLimitFromHint(turn)
+    if (throttled) throw throttled
+    // A failed attempt leaves the parent where it was, so the same-session
+    // retry branches from the previous node rather than the empty one. The
+    // accepted node becomes the parent only after the caller commits it.
+    return turnHasReply(turn) ? { ok: true, turn } : { ok: false, turn }
+  }
+
+  const fail = async (target, promptText) => {
+    try {
+      return await attempt(target, promptText)
+    } catch (err) {
+      // A stream that breaks while being read is a transport failure. The
+      // caller reports it; opening another chat would hide the disconnect.
+      if (err instanceof DeepSeekError && canReplaceSession(err, signal)) return { ok: false, error: err }
+      throw err
+    }
+  }
+
+  const first = await fail(conv, prompt)
+  if (first.ok) return { conv, turn: first.turn, replaced: false }
+
+  const retried = await fail(conv, prompt)
+  if (retried.ok) return { conv, turn: retried.turn, replaced: false }
+
+  // The next queued turn is already waiting on this same object. Retarget it
+  // in place so that turn follows the new DeepSeek chat instead of sending to
+  // a session we are about to drop. The old chat stays until the new one
+  // answers: if opening the new one fails, the next request can try again.
+  const oldId = conv.sessionId
+  const sessionId = await client.createSession(signal)
+  console.warn(
+    `[deepseek-web] session ${oldId} failed after a same-session retry; opened ${sessionId} and resent history`
+  )
+  let opened
+  try {
+    const upstream = await client.completion(
+      {
+        ...completionInput,
+        sessionId,
+        parentMessageId: null,
+        prompt: freshPrompt,
+      },
+      signal
+    )
+    const turn = await readUpstreamTurn(upstream.body)
+    const throttled = rateLimitFromHint(turn)
+    if (throttled) throw throttled
+    opened = turnHasReply(turn) ? { ok: true, turn } : { ok: false, turn }
+  } catch (err) {
+    await client.deleteSession?.(sessionId, signal)
+    if (!(err instanceof DeepSeekError) || !canReplaceSession(err, signal)) throw err
+    opened = { ok: false, error: err }
+  }
+  if (!opened.ok) {
+    await client.deleteSession?.(sessionId, signal)
+    throw (
+      opened.error ??
+      new DeepSeekError("deepseek returned an empty assistant turn after opening a new session")
+    )
+  }
+  await client.deleteSession?.(oldId, signal)
+  retargetConversation(conv, sessionId)
+  return { conv, turn: opened.turn, replaced: true }
+}
+
+/** Points a live conversation at a new upstream chat, keeping its queue and prefix keys. */
+function retargetConversation(conv, sessionId) {
+  const oldId = conv.sessionId
+  if (oldId !== sessionId) convStore.bySession.delete(oldId)
+  conv.sessionId = sessionId
+  conv.parentMessageId = null
+  conv.hasParent = false
+  conv.turn = 0
+  conv.lastUsage = -1
+  conv.hasUsage = false
+  convStore.bySession.set(sessionId, conv)
 }
 
 /**
@@ -246,10 +470,8 @@ export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
       provider: PROVIDER_ID,
 
       async loader(getAuth, provider) {
-        // The tool-call wire format: "toml" (the default) or "base64". The
-        // plugin's own option wins, then the provider's in OpenCode's config,
-        // then DEEPSEEK_WEB_TOOL_FORMAT.
-        const toolFormat = resolveToolFormat(options?.toolFormat ?? provider?.options?.toolFormat)
+        // Tool calls use plaintext JSON in a ```tool_call fence.
+        const toolFormat = resolveToolFormat()
         const auth = await getAuth()
         const token = normalizeUserToken(auth?.access ?? auth?.key)
         if (!token) return {}
@@ -319,7 +541,7 @@ export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
             }
 
             try {
-              const { conv, fresh } = await conversationFor({
+              let { conv, fresh } = await conversationFor({
                 messages,
                 modelId: model.id,
                 conversationId: body.conversation_id,
@@ -337,7 +559,9 @@ export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
               // A streamed turn holds the conversation until its stream ends,
               // so two turns never interleave; `release` is called by onFinish
               // or when the turn itself fails before a stream exists.
-              const release = await conv.acquire()
+              let release = await conv.acquire()
+              let startParentMessageId = conv.parentMessageId
+              let startHasParent = conv.hasParent
               try {
                 // Images ride as uploaded files; only this turn's are sent,
                 // older ones are already in the session's context. Uploading
@@ -349,34 +573,48 @@ export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
                   }
                 }
 
-                const { prompt } = buildTurnPrompt({
+                const promptArgs = {
                   messages,
                   tools,
                   toolChoice,
-                  fresh,
+                  parallelToolCalls: body.parallel_tool_calls,
                   toolFormat,
-                })
+                }
+                const { prompt } = buildTurnPrompt({ ...promptArgs, fresh })
+                // A replacement session has none of this chat, so it gets the
+                // whole history once. Later turns are incremental again.
+                const freshPrompt = fresh ? prompt : buildTurnPrompt({ ...promptArgs, fresh: true }).prompt
 
-                const previousUsage = conv.hasUsage ? conv.lastUsage : -1
-
-                const upstream = await deepseekClient.completion(
-                  {
-                    sessionId: conv.sessionId,
-                    parentMessageId: conv.hasParent ? conv.parentMessageId : null,
-                    modelType: conv.hasParent ? null : "default",
-                    prompt,
+                const resolved = await resolveSessionTurn({
+                  conv,
+                  prompt,
+                  freshPrompt,
+                  client: deepseekClient,
+                  token,
+                  signal,
+                  completionInput: {
+                    // The web UI leaves model_type null so DeepSeek selects the
+                    // current model for this session. Never derive an upstream
+                    // model id from the provider's outer model label.
+                    modelType: null,
                     refFileIds,
                     thinkingEnabled: model.thinking,
                     searchEnabled: model.search,
                   },
-                  signal
-                )
+                })
+                if (resolved.replaced) {
+                  // The conversation object did not change, so the lock already
+                  // held stays the lock. The new chat has no parent yet.
+                  startParentMessageId = null
+                  startHasParent = false
+                }
+
+                const previousUsage = conv.hasUsage ? conv.lastUsage : -1
+                const upstreamStream = replayUpstream(resolved.turn)
 
                 const completionId = newCompletionId()
                 const createdAt = Math.floor(Date.now() / 1000)
 
-                const startParentMessageId = conv.parentMessageId
-                const startHasParent = conv.hasParent
                 let latestResponseId = null
 
                 const onSessionReady = (requestId, responseId) => {
@@ -421,9 +659,48 @@ export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
                   release()
                 }
 
+                const repairToolCall = async (error) => {
+                  try {
+                    if (!latestResponseId) throw error
+                    const repairChoice = toolChoice?.function?.name ? toolChoice : "required"
+                    const repairPrompt = toolPromptsFor(toolFormat, tools, repairChoice).build(tools, repairChoice)
+                    const repaired = await deepseekClient.completion({
+                      sessionId: conv.sessionId,
+                      parentMessageId: latestResponseId,
+                      modelType: null,
+                      prompt: `${error.message}\nNo tools from that response were executed. Re-emit the complete batch using the tool definitions below. Preserve file contents exactly; do not explain or claim success.\n\n${repairPrompt}\n\n${body.parallel_tool_calls === false ? "Emit exactly one tool call; parallel calls are disabled." : "Emit all independent calls in this batch together."}`,
+                      refFileIds: [],
+                      thinkingEnabled: model.thinking,
+                      searchEnabled: model.search,
+                    }, signal)
+                    latestResponseId = null
+                    const createResponse = stream ? createOpenAiStreamResponse : createOpenAiJsonResponse
+                    return await createResponse({
+                      upstreamStream: repaired.body,
+                      completionId,
+                      modelName: model.id,
+                      createdAt,
+                      previousUsage,
+                      onSessionReady,
+                      onFinish,
+                      streamOptions: body.stream_options,
+                      signal,
+                      hasTools,
+                      toolFormat,
+                      tools,
+                      toolChoice: repairChoice,
+                      parallelToolCalls: body.parallel_tool_calls,
+                      repairError: error,
+                    })
+                  } catch (err) {
+                    onFinish(-1, "", null, null, true)
+                    throw err
+                  }
+                }
+
                 if (stream) {
                   return createOpenAiStreamResponse({
-                    upstreamStream: upstream.body,
+                    upstreamStream,
                     completionId,
                     modelName: model.id,
                     createdAt,
@@ -434,10 +711,14 @@ export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
                     signal,
                     hasTools,
                     toolFormat,
+                    tools,
+                    toolChoice,
+                    parallelToolCalls: body.parallel_tool_calls,
+                    repairToolCall,
                   })
                 }
-                return createOpenAiJsonResponse({
-                  upstreamStream: upstream.body,
+                return await createOpenAiJsonResponse({
+                  upstreamStream,
                   completionId,
                   modelName: model.id,
                   createdAt,
@@ -446,6 +727,10 @@ export async function DeepSeekWebPlugin({ client } = {}, options = {}) {
                   onFinish,
                   hasTools,
                   toolFormat,
+                  tools,
+                  toolChoice,
+                  parallelToolCalls: body.parallel_tool_calls,
+                  repairToolCall,
                 })
               } catch (err) {
                 conv.rollback(startParentMessageId, startHasParent)
@@ -504,6 +789,9 @@ export default DeepSeekWebPlugin
 export const _internal = {
   convStore,
   conversationFor,
+  resolveSessionTurn,
+  canReplaceSession,
+  turnHasReply,
   mapUpstreamError,
   normalizeUserToken,
   buildTurnPrompt,

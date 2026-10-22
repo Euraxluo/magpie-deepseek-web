@@ -77,7 +77,13 @@ export function calculatePrefixKey(messages, modelName) {
   for (const m of messages || []) {
     hash.update(String(m?.role ?? ""))
     hash.update("\x1f")
-    hash.update(contentFingerprint(m?.content))
+    // A tool-calling assistant turn carries no prose: SDKs send it as "",
+    // null or whitespace-only text depending on the client. The upstream
+    // session saw the same (empty) thing either way, so it must not split
+    // the key.
+    const hasCalls = Array.isArray(m?.tool_calls) && m.tool_calls.length > 0
+    const text = contentFingerprint(m?.content)
+    hash.update(hasCalls && text.trim() === "" ? "" : text)
     if (Array.isArray(m?.tool_calls) && m.tool_calls.length > 0) {
       hash.update("\x1c")
       for (const tc of m.tool_calls) {
@@ -247,6 +253,12 @@ export class ConversationStore {
     for (const [k, v] of this.byPrefix) {
       if (v === conv) this.byPrefix.delete(k)
     }
+  }
+
+  /** Test hook. Drops every mapping without touching upstream sessions. */
+  clear() {
+    this.byPrefix.clear()
+    this.bySession.clear()
   }
 
   /**

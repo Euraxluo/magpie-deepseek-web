@@ -1,5 +1,7 @@
 import { randomBytes } from "node:crypto"
+import { DeepSeekError } from "./client.mjs"
 import { parseToolCallsAnyFormat, ToolFenceGate } from "./toml.mjs"
+import { ToolProtocolError, validateToolCalls } from "./tool-protocol.mjs"
 
 /**
  * Creates an OpenAI-compatible completion ID.
@@ -16,6 +18,7 @@ export function newCompletionId() {
  * @param {function(number, number): void} [callbacks.onReady] - (requestId, responseId)
  * @param {function('THINK'|'RESPONSE', string): void} [callbacks.onDelta] - (type, deltaText)
  * @param {function(number): void} [callbacks.onUsage] - (accumulatedTokenUsage)
+ * @param {function({content: string, finishReason: string}): void} [callbacks.onHint] - DeepSeek's `hint` frame
  * @param {function(): void} [callbacks.onClose]
  */
 export async function readDeepSeekSseStream(stream, callbacks) {
@@ -123,6 +126,19 @@ export async function readDeepSeekSseStream(stream, callbacks) {
       return false
     }
 
+    if (ev === "hint") {
+      // DeepSeek says "too many messages, retry later" as a hint frame with no
+      // reply, not as an HTTP status: the stream is a 200 and closes right
+      // after. Left unread, the turn looks empty and gets retried.
+      try {
+        const h = JSON.parse(dataText)
+        if (callbacks.onHint && h && typeof h === "object") {
+          callbacks.onHint({ content: String(h.content ?? ""), finishReason: String(h.finish_reason ?? "") })
+        }
+      } catch {}
+      return false
+    }
+
     if (ev === "update_session" || ev === "title" || ev === "") {
       applyPatch(dataText)
     }
@@ -204,7 +220,12 @@ export function createOpenAiStreamResponse({
   streamOptions,
   signal,
   hasTools = false,
-  toolFormat = "toml",
+  toolFormat = "json",
+  tools,
+  toolChoice,
+  parallelToolCalls,
+  repairToolCall,
+  repairError,
 }) {
   const encoder = new TextEncoder()
   const accumulated = { value: -1 }
@@ -263,9 +284,27 @@ export function createOpenAiStreamResponse({
           },
         })
 
-        if (hasTools && gate) {
-          gate.flush()
+        // Validate the complete batch before emitting either text or calls.
+        const parsed = hasTools ? parseToolCallsAnyFormat(reply, toolFormat) : null
+        try {
+          if (parsed?.error) throw parsed.error
+          if (parsed) validateToolCalls(parsed.toolCalls, { tools, toolChoice, parallelToolCalls })
+        } catch (err) {
+          if (repairError) throw new ToolProtocolError(`repair failed (${repairError.message}); corrected response was invalid (${err.message})`)
+          if (!repairToolCall || err?.code !== "invalid_tool_call") throw err
+          // Nothing from this batch has reached the caller. One upstream-only
+          // correction is safe; the replacement stream has no repair callback.
+          const replacement = await repairToolCall(err)
+          const reader = replacement.body.getReader()
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+            controller.enqueue(value)
+          }
+          controller.close()
+          return
         }
+        if (hasTools && gate) gate.flush()
 
         const { usage, total } = turnUsage({
           accumulated: accumulated.value,
@@ -274,7 +313,7 @@ export function createOpenAiStreamResponse({
         })
 
         if (hasTools) {
-          const { toolCalls, cleanText } = parseToolCallsAnyFormat(reply, toolFormat)
+          const { toolCalls, cleanText } = parsed
           if (toolCalls.length > 0) {
             sendDelta({
               ...takeRole(),
@@ -298,7 +337,7 @@ export function createOpenAiStreamResponse({
         sendDelta(takeRole(), "stop", streamOptions?.include_usage ? usage : null)
         send("[DONE]")
         controller.close()
-        if (onFinish) onFinish(total, reply, null, reply, false)
+        if (onFinish) onFinish(total, reply, null, gate?.sent ?? reply, false)
       } catch (err) {
         if (signal?.aborted) {
           try {
@@ -310,7 +349,7 @@ export function createOpenAiStreamResponse({
         // Tell the client what went wrong the way OpenAI's own streams do,
         // so a reasoning UI shows the message instead of a bare disconnect.
         try {
-          send({ error: { message: err?.message || String(err), type: "api_error" } })
+          send({ error: { message: err?.message || String(err), type: "api_error", code: err?.code ?? null } })
           send("[DONE]")
         } catch {}
         try {
@@ -348,7 +387,12 @@ export async function createOpenAiJsonResponse({
   onSessionReady,
   onFinish,
   hasTools = false,
-  toolFormat = "toml",
+  toolFormat = "json",
+  tools,
+  toolChoice,
+  parallelToolCalls,
+  repairToolCall,
+  repairError,
 }) {
   let content = ""
   let reasoningContent = ""
@@ -379,6 +423,26 @@ export async function createOpenAiJsonResponse({
 
   if (hasTools) {
     const parsed = parseToolCallsAnyFormat(content, toolFormat)
+    try {
+      if (parsed.error) throw parsed.error
+      validateToolCalls(parsed.toolCalls, { tools, toolChoice, parallelToolCalls })
+    } catch (err) {
+      if (repairError) {
+        if (onFinish) onFinish(total, content, null, null, true)
+        return new Response(JSON.stringify({ error: { type: "api_error", code: "invalid_tool_call", message: `repair failed (${repairError.message}); corrected response was invalid (${err.message})` } }), {
+          status: 502,
+          headers: { "Content-Type": "application/json; charset=utf-8" },
+        })
+      }
+      if (repairToolCall && err?.code === "invalid_tool_call") {
+        return repairToolCall(err)
+      }
+      if (onFinish) onFinish(total, content, null, null, true)
+      return new Response(JSON.stringify({ error: { type: "api_error", code: err.code ?? "invalid_tool_call", message: err.message } }), {
+        status: 502,
+        headers: { "Content-Type": "application/json; charset=utf-8" },
+      })
+    }
     if (parsed.toolCalls.length > 0) {
       toolCalls = parsed.toolCalls
       finishReason = "tool_calls"
